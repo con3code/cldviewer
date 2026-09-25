@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 cldviewer — Claude Code セッションログビューア（単一ファイル・標準ライブラリのみ）
+cldviewer — Claude Code session log viewer (single file, standard library only)
 
-使い方:
+使い方 / Usage:
   python3 cldviewer.py                 # ~/.claude/projects を読み込んでブラウザで開く
   python3 cldviewer.py --port 9000     # ポート指定
   python3 cldviewer.py --dir PATH      # ログディレクトリを指定（別端末からコピーしたログなど）
@@ -14,6 +15,7 @@ cldviewer — Claude Code セッションログビューア（単一ファイル
   python3 cldviewer.py csv --project KEYWORD --mode prompts|pairs|full -o out.csv
                                        # CSV 書き出し
   python3 cldviewer.py list            # プロジェクト一覧を表示
+  python3 cldviewer.py --lang en       # 英語表示（UI の初期言語・CSV・メッセージ）/ English
 """
 import argparse
 import csv
@@ -31,12 +33,86 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+LANG = "ja"  # CLI メッセージ・CSV 見出し・UI 初期言語（--lang / CLDVIEWER_LANG）
+
+MSG = {
+    "ja": {
+        "desc": "Claude Code セッションログビューア",
+        "h_dir": "ログディレクトリ（複数指定可。既定: ~/.claude/projects）",
+        "h_nocache": "解析キャッシュ（~/.cache/cldviewer）を使わない",
+        "h_noconfig": "保存済みの設定（追加したログの場所・プロジェクト統合）を読み込まない",
+        "h_lang": "表示言語 ja / en（UI の初期言語・CSV 見出し・メッセージ。環境変数 CLDVIEWER_LANG でも指定可）",
+        "h_serve": "ローカルサーバを起動してブラウザで開く（既定）",
+        "h_export": "データ埋め込み済みの単体 HTML を書き出す",
+        "h_project": "対象プロジェクト（パスや名前の部分一致、複数可）",
+        "h_light": "ツールログ・推論を省いて軽量化",
+        "h_csv": "CSV を書き出す",
+        "h_list": "プロジェクト一覧",
+        "no_dir": "注意: ログディレクトリが見つかりません（スキップ）: %s",
+        "no_dirs": "読めるログディレクトリがありません",
+        "no_port": "ポートを確保できませんでした",
+        "log": "ログ: %s%s", "missing": "  (見つかりません)", "quit": "終了は Ctrl+C", "bye": "\n終了",
+        "no_projects": "対象プロジェクトがありません", "loading": "読み込み: %s", "done": "  完了 %.1fs, %d ターン",
+        "exported": "書き出し: %s (%.1f MB, %d プロジェクト)", "written": "書き出し: %s",
+        "pick_one": "プロジェクトを 1 つに絞ってください（--project KEYWORD）。候補:",
+        "places": "  [%d か所]", "group": "  [統合: %s]",
+        "dir_missing": "ディレクトリがありません: %s", "no_project_dirs": "プロジェクトフォルダが見つかりません: %s",
+        "select_two": "2 つ以上のプロジェクトを選んでください",
+        "save_failed": "warn: 設定の保存に失敗: %s", "groups_save_failed": "warn: 統合設定の保存に失敗: %s",
+        "kinds": {"typed": "依頼", "queued": "依頼(割込)", "command": "コマンド", "shell": "シェル",
+                  "peer": "他エージェント", "continuation": "継続", "auto": "自動"},
+        "steps": {"text": "応答", "thinking": "推論", "notification": "通知", "system": "システム",
+                  "compact": "圧縮サマリー", "compact_boundary": "圧縮", "interrupt": "中断", "meta": "コマンド展開"},
+        "labels": {"auto": "（プロンプトなしで開始）", "continuation": "（前セッションからの継続）"},
+        "csv_prompts": ["日時", "セッション", "種別", "依頼"],
+        "csv_pairs": ["日時", "セッション", "種別", "依頼", "応答日時", "応答", "要約", "所要時間(秒)", "ツール回数"],
+        "csv_full": ["日時", "セッション", "ターン番号", "種類", "名前", "内容"],
+        "csv_prompt_kind": "依頼(%s)", "csv_tool_call": "ツール呼び出し", "csv_tool_result": "ツール結果", "csv_tool_result_err": "ツール結果(エラー)",
+    },
+    "en": {
+        "desc": "Claude Code session log viewer",
+        "h_dir": "log directory (repeatable; default: ~/.claude/projects)",
+        "h_nocache": "do not use the parse cache (~/.cache/cldviewer)",
+        "h_noconfig": "ignore saved settings (added log locations, merged projects)",
+        "h_lang": "language ja / en (initial UI language, CSV headers, messages; also CLDVIEWER_LANG)",
+        "h_serve": "start the local server and open the browser (default)",
+        "h_export": "write a standalone HTML with the data embedded",
+        "h_project": "target projects (substring of path or name; repeatable)",
+        "h_light": "omit tool logs and reasoning to keep the file small",
+        "h_csv": "write a CSV file",
+        "h_list": "list projects",
+        "no_dir": "note: log directory not found (skipped): %s",
+        "no_dirs": "no readable log directory",
+        "no_port": "could not bind a port",
+        "log": "logs: %s%s", "missing": "  (not found)", "quit": "Ctrl+C to quit", "bye": "\nbye",
+        "no_projects": "no matching project", "loading": "loading: %s", "done": "  done %.1fs, %d turns",
+        "exported": "written: %s (%.1f MB, %d projects)", "written": "written: %s",
+        "pick_one": "narrow down to one project (--project KEYWORD). candidates:",
+        "places": "  [%d locations]", "group": "  [merged: %s]",
+        "dir_missing": "directory does not exist: %s", "no_project_dirs": "no project folders found in: %s",
+        "select_two": "select two or more projects",
+        "save_failed": "warn: failed to save settings: %s", "groups_save_failed": "warn: failed to save merge settings: %s",
+        "kinds": {"typed": "Prompt", "queued": "Prompt (mid-turn)", "command": "Command", "shell": "Shell",
+                  "peer": "Other agent", "continuation": "Continued", "auto": "Auto"},
+        "steps": {"text": "Response", "thinking": "Reasoning", "notification": "Notice", "system": "System",
+                  "compact": "Compact summary", "compact_boundary": "Compacted", "interrupt": "Interrupted", "meta": "Command expansion"},
+        "labels": {"auto": "(started without a prompt)", "continuation": "(continued from previous session)"},
+        "csv_prompts": ["Time", "Session", "Kind", "Prompt"],
+        "csv_pairs": ["Time", "Session", "Kind", "Prompt", "Response time", "Response", "Recap", "Duration (s)", "Tool calls"],
+        "csv_full": ["Time", "Session", "Turn", "Type", "Name", "Content"],
+        "csv_prompt_kind": "Prompt (%s)", "csv_tool_call": "Tool call", "csv_tool_result": "Tool result", "csv_tool_result_err": "Tool result (error)",
+    },
+}
+
+
+def _(key):
+    return MSG.get(LANG, MSG["ja"]).get(key, MSG["ja"].get(key, key))
 DEFAULT_DIR = os.path.expanduser("~/.claude/projects")
 CACHE_DIR = os.path.expanduser("~/.cache/cldviewer")
 CONFIG_FILE = os.path.expanduser("~/.config/cldviewer/roots.json")  # UI から追加したログの場所
 GROUPS_FILE = os.path.expanduser("~/.config/cldviewer/groups.json")  # プロジェクト統合の定義
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 MAX_TEXT = 20000        # ツール入出力 1 件あたりの保持上限（文字）
 MAX_SUB_TEXT = 4000     # サブエージェントの各ステップの保持上限
 
@@ -54,7 +130,7 @@ def trim(s, limit=MAX_TEXT):
         except Exception:
             s = str(s)
     if len(s) > limit:
-        return s[:limit] + "\n…（%d 文字省略）" % (len(s) - limit)
+        return s[:limit] + "\n… (%d chars omitted / 文字省略)" % (len(s) - limit)
     return s
 
 
@@ -101,9 +177,9 @@ def content_to_text(content):
             parts.append(b.get("text", ""))
         elif bt == "image":
             images += 1
-            parts.append("[画像]")
+            parts.append("[image]")
         elif bt == "document":
-            parts.append("[添付ドキュメント]")
+            parts.append("[document]")
     return "\n".join(p for p in parts if p), images
 
 
@@ -173,7 +249,7 @@ class SessionParser:
 
     def ensure_turn(self, ts):
         if self.cur is None:
-            self.new_turn(ts, "auto", "", label="（プロンプトなしで開始）")
+            self.new_turn(ts, "auto", "", labelKey="auto")
         return self.cur
 
     def add_step(self, ts, kind, **fields):
@@ -242,7 +318,7 @@ class SessionParser:
         elif sub == "compact_boundary":
             self.sess["compactions"] += 1
             meta = o.get("compactMetadata") or {}
-            self.add_step(ts, "compact_boundary", text="会話が圧縮されました（%s: %s → %s tokens）" % (
+            self.add_step(ts, "compact_boundary", text="compact: %s, %s → %s tokens" % (
                 meta.get("trigger", "?"), meta.get("preTokens", "?"), meta.get("postTokens", "?")))
         elif sub in ("local_command", "bridge_status", "informational"):
             c = o.get("content")
@@ -307,7 +383,7 @@ class SessionParser:
         if o.get("isCompactSummary"):
             first = self.cur is None
             if first:
-                self.new_turn(ts, "continuation", "", label="（前セッションからの継続）")
+                self.new_turn(ts, "continuation", "", labelKey="continuation")
             self.add_step(ts, "compact", text=trim(text, MAX_TEXT))
             return
         if origin_kind == "peer":
@@ -635,7 +711,7 @@ def save_roots(roots):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({"roots": roots}, f, ensure_ascii=False, indent=1)
     except Exception as e:
-        sys.stderr.write("warn: 設定の保存に失敗: %s\n" % e)
+        sys.stderr.write(_("save_failed") % e + "\n")
 
 
 def norm_root(p):
@@ -673,7 +749,7 @@ def save_groups(groups):
         with open(GROUPS_FILE, "w", encoding="utf-8") as f:
             json.dump({"groups": groups}, f, ensure_ascii=False, indent=1)
     except Exception as e:
-        sys.stderr.write("warn: 統合設定の保存に失敗: %s\n" % e)
+        sys.stderr.write(_("groups_save_failed") % e + "\n")
 
 
 def find_group(groups, pid):
@@ -938,43 +1014,45 @@ def fmt_local(ts):
     return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
-KIND_LABEL = {"typed": "依頼", "queued": "依頼(割込)", "command": "コマンド", "shell": "シェル",
-              "peer": "他エージェント", "continuation": "継続", "auto": "自動"}
+def turn_label(t):
+    if t.get("prompt"):
+        return t["prompt"]
+    return _("labels").get(t.get("labelKey"), t.get("label", ""))
 
 
 def project_csv(project, mode="prompts"):
     buf = io.StringIO()
     w = csv.writer(buf)
+    KIND_LABEL = _("kinds")
     stitle = {s["id"]: (s.get("title") or s["id"][:8]) for s in project["sessions"]}
     if mode == "prompts":
-        w.writerow(["日時", "セッション", "種別", "依頼"])
+        w.writerow(_("csv_prompts"))
         for t in project["turns"]:
             if t["kind"] not in ("typed", "queued", "command", "shell"):
                 continue
             w.writerow([fmt_local(t["ts"]), stitle.get(t["sid"], t["sid"]), KIND_LABEL.get(t["kind"], t["kind"]), t["prompt"]])
     elif mode == "pairs":
-        w.writerow(["日時", "セッション", "種別", "依頼", "応答日時", "応答", "要約", "所要時間(秒)", "ツール回数"])
+        w.writerow(_("csv_pairs"))
         for t in project["turns"]:
             resp = "\n\n".join(r["text"] for r in t["responses"])
             rts = t["responses"][-1]["ts"] if t["responses"] else ""
             w.writerow([fmt_local(t["ts"]), stitle.get(t["sid"], t["sid"]), KIND_LABEL.get(t["kind"], t["kind"]),
-                        t["prompt"] or t.get("label", ""), fmt_local(rts), resp, t.get("recap") or "",
+                        turn_label(t), fmt_local(rts), resp, t.get("recap") or "",
                         round((t.get("durationMs") or 0) / 1000), t["toolCount"]])
     else:
-        w.writerow(["日時", "セッション", "ターン番号", "種類", "名前", "内容"])
+        w.writerow(_("csv_full"))
         for i, t in enumerate(project["turns"], 1):
-            w.writerow([fmt_local(t["ts"]), stitle.get(t["sid"], t["sid"]), i, "依頼(%s)" % KIND_LABEL.get(t["kind"], t["kind"]), "", t["prompt"] or t.get("label", "")])
+            w.writerow([fmt_local(t["ts"]), stitle.get(t["sid"], t["sid"]), i, _("csv_prompt_kind") % KIND_LABEL.get(t["kind"], t["kind"]), "", turn_label(t)])
             for s in t["steps"]:
                 k = s["kind"]
                 if k == "tool":
                     inp = s.get("input")
                     inp_s = inp if isinstance(inp, str) else json.dumps(inp, ensure_ascii=False)
-                    w.writerow([fmt_local(s["ts"]), stitle.get(t["sid"], t["sid"]), i, "ツール呼び出し", s.get("name"), inp_s])
+                    w.writerow([fmt_local(s["ts"]), stitle.get(t["sid"], t["sid"]), i, _("csv_tool_call"), s.get("name"), inp_s])
                     if s.get("result") is not None:
-                        w.writerow([fmt_local(s.get("resultTs") or s["ts"]), stitle.get(t["sid"], t["sid"]), i, "ツール結果" + ("(エラー)" if s.get("isError") else ""), s.get("name"), s["result"]])
+                        w.writerow([fmt_local(s.get("resultTs") or s["ts"]), stitle.get(t["sid"], t["sid"]), i, _("csv_tool_result_err") if s.get("isError") else _("csv_tool_result"), s.get("name"), s["result"]])
                 else:
-                    label = {"text": "応答", "thinking": "推論", "notification": "通知", "system": "システム",
-                             "compact": "圧縮サマリー", "compact_boundary": "圧縮", "interrupt": "中断", "meta": "コマンド展開"}.get(k, k)
+                    label = _("steps").get(k, k)
                     w.writerow([fmt_local(s["ts"]), stitle.get(t["sid"], t["sid"]), i, label, s.get("name", ""), s.get("text", "")])
     return "﻿" + buf.getvalue()
 
@@ -1007,9 +1085,9 @@ class Store:
     def add_root(self, path):
         r = norm_root(path)
         if not os.path.isdir(r):
-            raise FileNotFoundError("ディレクトリがありません: %s" % r)
+            raise FileNotFoundError(_("dir_missing") % r)
         if not any(os.path.isdir(os.path.join(r, d)) for d in os.listdir(r)):
-            raise ValueError("プロジェクトフォルダが見つかりません: %s" % r)
+            raise ValueError(_("no_project_dirs") % r)
         if r not in self.saved_roots and r not in self.cli_roots:
             self.saved_roots.append(r)
             save_roots(self.saved_roots)
@@ -1043,7 +1121,7 @@ class Store:
                 if x not in flat:
                     flat.append(x)
         if len(flat) < 2:
-            raise ValueError("2 つ以上のプロジェクトを選んでください")
+            raise ValueError(_("select_two"))
         self.groups = [g for g in self.groups if g["id"] not in members]
         # 他グループと重なるメンバーは移動
         for g in self.groups:
@@ -1078,11 +1156,11 @@ class Store:
             return cached
         def prog(i, n, f):
             sys.stderr.write("  [%d/%d] %s (%.1f MB)\n" % (i + 1, n, os.path.basename(f), os.path.getsize(f) / 1e6))
-        sys.stderr.write("読み込み: %s\n" % pid)
+        sys.stderr.write(_("loading") % pid + "\n")
         t0 = time.time()
         p = load_project(self.roots, pid, self.use_cache, prog, self.groups)
         p["_sig"] = self.signature(pid)
-        sys.stderr.write("  完了 %.1fs, %d ターン\n" % (time.time() - t0, len(p["turns"])))
+        sys.stderr.write(_("done") % (time.time() - t0, len(p["turns"])) + "\n")
         with self.lock:
             self.projects_cache[pid] = p
         return p
@@ -1155,7 +1233,7 @@ def make_handler(store):
             path = unquote(u.path)
             try:
                 if path == "/" or path == "/index.html":
-                    self.send_text(HTML.replace("__EMBEDDED__", "null").replace("__VERSION__", VERSION))
+                    self.send_text(HTML.replace("__EMBEDDED__", "null").replace("__VERSION__", VERSION).replace("__LANG__", LANG))
                 elif path == "/api/projects":
                     self.send_json(self.projects_payload())
                 elif path.startswith("/api/project/"):
@@ -1197,9 +1275,9 @@ def cmd_serve(args):
     roots = resolve_roots(args.dir, use_saved=not args.no_config)
     missing = [r for r in roots if not os.path.isdir(r)]
     for r in missing:
-        sys.stderr.write("注意: ログディレクトリが見つかりません（スキップ）: %s\n" % r)
+        sys.stderr.write(_("no_dir") % r + "\n")
     if len(missing) == len(roots):
-        sys.exit("読めるログディレクトリがありません")
+        sys.exit(_("no_dirs"))
     store = Store([norm_root(d) for d in (args.dir or [DEFAULT_DIR])], use_cache=not args.no_cache)
     if args.no_config:
         store.saved_roots = []
@@ -1213,18 +1291,18 @@ def cmd_serve(args):
         except OSError:
             continue
     if httpd is None:
-        sys.exit("ポートを確保できませんでした")
+        sys.exit(_("no_port"))
     url = "http://%s:%d/" % ("localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host, port)
     print("cldviewer %s  —  %s" % (VERSION, url))
     for r in store.roots:
-        print("ログ: %s%s" % (r, "" if os.path.isdir(r) else "  (見つかりません)"))
-    print("終了は Ctrl+C")
+        print(_("log") % (r, "" if os.path.isdir(r) else _("missing")))
+    print(_("quit"))
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n終了")
+        print(_("bye"))
 
 
 def select_projects(roots, keywords, groups=None):
@@ -1244,10 +1322,10 @@ def cmd_export(args):
     groups = [] if args.no_config else load_groups()
     projects = select_projects(root, args.project, groups)
     if not projects:
-        sys.exit("対象プロジェクトがありません")
+        sys.exit(_("no_projects"))
     data = {}
     for p in projects:
-        sys.stderr.write("読み込み: %s\n" % p["id"])
+        sys.stderr.write(_("loading") % p["id"] + "\n")
         full = load_project(root, p["id"], not args.no_cache, None, groups)
         if args.light:
             for t in full["turns"]:
@@ -1264,10 +1342,10 @@ def cmd_export(args):
         data[p["id"]] = emb
     payload = json.dumps({"roots": [{"path": r, "ok": True, "saved": False} for r in root], "projects": projects, "data": data}, ensure_ascii=False)
     payload = payload.replace("</", "<\\/")
-    out = HTML.replace("__EMBEDDED__", payload).replace("__VERSION__", VERSION)
+    out = HTML.replace("__EMBEDDED__", payload).replace("__VERSION__", VERSION).replace("__LANG__", LANG)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(out)
-    print("書き出し: %s (%.1f MB, %d プロジェクト)" % (args.out, len(out.encode("utf-8")) / 1e6, len(projects)))
+    print(_("exported") % (args.out, len(out.encode("utf-8")) / 1e6, len(projects)))
 
 
 def cmd_csv(args):
@@ -1275,7 +1353,7 @@ def cmd_csv(args):
     groups = [] if args.no_config else load_groups()
     projects = select_projects(root, args.project, groups)
     if len(projects) != 1:
-        print("プロジェクトを 1 つに絞ってください（--project KEYWORD）。候補:")
+        print(_("pick_one"))
         for p in projects:
             print("  %s  %s" % (p["id"], p["path"]))
         sys.exit(1)
@@ -1284,49 +1362,68 @@ def cmd_csv(args):
     out = args.out or "%s-%s.csv" % (p["name"], args.mode)
     with open(out, "w", encoding="utf-8", newline="") as f:
         f.write(text)
-    print("書き出し: %s" % out)
+    print(_("written") % out)
 
 
 def cmd_list(args):
     roots = resolve_roots(args.dir, use_saved=not args.no_config)
     for r in roots:
-        print("# %s%s" % (r, "" if os.path.isdir(r) else "  (見つかりません)"))
+        print("# %s%s" % (r, "" if os.path.isdir(r) else _("missing")))
     groups = [] if args.no_config else load_groups()
     for p in list_projects(roots, groups):
         print("%-8s %3d sessions %7.1f MB  %s%s%s" % (p["lastModified"][:10], p["sessionCount"], p["bytes"] / 1e6, p["path"],
-                                                     "  [%d か所]" % len(p["roots"]) if len(p["roots"]) > 1 else "",
-                                                     "  [統合: %s]" % p["name"] if p.get("group") else ""))
+                                                     _("places") % len(p["roots"]) if len(p["roots"]) > 1 else "",
+                                                     _("group") % p["name"] if p.get("group") else ""))
 
 
 def main(argv=None):
+    global LANG
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # ヘルプ文にも反映するため、言語だけ先に決める
+    env_lang = os.environ.get("CLDVIEWER_LANG", "").lower()
+    if env_lang in MSG:
+        LANG = env_lang
+    for i, a in enumerate(argv):
+        if a.startswith("--lang="):
+            LANG = a.split("=", 1)[1]
+        elif a == "--lang" and i + 1 < len(argv):
+            LANG = argv[i + 1]
+    if LANG not in MSG:
+        LANG = "ja"
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--dir", action="append", help="ログディレクトリ（複数指定可。既定: ~/.claude/projects）")
-    common.add_argument("--no-cache", action="store_true", help="解析キャッシュ（~/.cache/cldviewer）を使わない")
-    common.add_argument("--no-config", action="store_true", help="保存済みの設定（追加したログの場所・プロジェクト統合）を読み込まない")
-    ap = argparse.ArgumentParser(description="Claude Code セッションログビューア", parents=[common])
+    common.add_argument("--dir", action="append", help=_("h_dir"))
+    common.add_argument("--no-cache", action="store_true", help=_("h_nocache"))
+    common.add_argument("--no-config", action="store_true", help=_("h_noconfig"))
+    common.add_argument("--lang", choices=["ja", "en"], default=LANG, help=_("h_lang"))
+    ap = argparse.ArgumentParser(description=_("desc"), parents=[common])
     sub = ap.add_subparsers(dest="cmd")
 
-    sp = sub.add_parser("serve", help="ローカルサーバを起動してブラウザで開く（既定）", parents=[common])
+    sp = sub.add_parser("serve", help=_("h_serve"), parents=[common])
     sp.add_argument("--port", type=int, default=8765)
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--no-browser", action="store_true")
 
-    ep = sub.add_parser("export", help="データ埋め込み済みの単体 HTML を書き出す", parents=[common])
+    ep = sub.add_parser("export", help=_("h_export"), parents=[common])
     ep.add_argument("-o", "--out", default="cldviewer-export.html")
-    ep.add_argument("--project", nargs="*", default=[], help="対象プロジェクト（パスの部分一致、複数可）")
-    ep.add_argument("--light", action="store_true", help="ツールログ・推論を省いて軽量化")
+    ep.add_argument("--project", nargs="*", default=[], help=_("h_project"))
+    ep.add_argument("--light", action="store_true", help=_("h_light"))
 
-    cp = sub.add_parser("csv", help="CSV を書き出す", parents=[common])
-    cp.add_argument("--project", nargs="*", default=[], help="対象プロジェクト（パスの部分一致）")
+    cp = sub.add_parser("csv", help=_("h_csv"), parents=[common])
+    cp.add_argument("--project", nargs="*", default=[], help=_("h_project"))
     cp.add_argument("--mode", choices=["prompts", "pairs", "full"], default="prompts")
     cp.add_argument("-o", "--out")
 
-    sub.add_parser("list", help="プロジェクト一覧", parents=[common])
+    sub.add_parser("list", help=_("h_list"), parents=[common])
 
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
+    # サブコマンドはどの位置にあっても先頭に移す。無ければ serve。
+    cmds = ("serve", "export", "csv", "list")
+    pos = next((i for i, a in enumerate(argv) if a in cmds), None)
+    if pos is not None:
+        argv = [argv[pos]] + argv[:pos] + argv[pos + 1:]
+    elif not argv or argv[0] not in ("-h", "--help"):
         argv = ["serve"] + argv
     args = ap.parse_args(argv)
+    LANG = args.lang
     if args.cmd == "export":
         cmd_export(args)
     elif args.cmd == "csv":
@@ -1509,32 +1606,33 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
   <aside id="side">
     <div class="side-head">
       <h1>cldviewer</h1>
-      <button class="small" id="btnMerge" title="複数のプロジェクトを選んで 1 つに統合">統合…</button>
-      <button class="icon" id="btnReloadList" title="プロジェクト一覧を再読み込み">↻</button>
+      <button class="small" id="btnMerge" data-i18n="btnMerge" data-i18n-title="btnMergeTitle"></button>
+      <button class="small" id="btnLang" title="Language"></button>
+      <button class="icon" id="btnReloadList" data-i18n-title="btnReloadList">↻</button>
     </div>
-    <input type="search" id="projFilter" placeholder="プロジェクトを絞り込み">
+    <input type="search" id="projFilter" data-i18n-placeholder="projFilter">
     <div id="suggest" class="hidden"></div>
     <div id="mergeBar" class="hidden">
-      <div class="small muted">統合するプロジェクトにチェック（2 つ以上）</div>
-      <div style="display:flex;gap:4px;margin-top:4px"><input type="text" id="mergeName" placeholder="統合後の名前" style="flex:1;min-width:0;margin:0"><button class="small" id="btnMergeDo">統合する</button><button class="small" id="btnMergeCancel">中止</button></div>
+      <div class="small muted" data-i18n="mergeHint"></div>
+      <div style="display:flex;gap:4px;margin-top:4px"><input type="text" id="mergeName" data-i18n-placeholder="mergeName" style="flex:1;min-width:0;margin:0"><button class="small" id="btnMergeDo" data-i18n="btnMergeDo"></button><button class="small" id="btnMergeCancel" data-i18n="btnMergeCancel"></button></div>
     </div>
     <ul id="projList"></ul>
     <div class="side-foot">
-      <div style="margin-bottom:4px">ログの場所</div>
+      <div style="margin-bottom:4px" data-i18n="rootsTitle"></div>
       <div id="roots"></div>
-      <div id="rootAdd" style="display:flex;gap:4px;margin-top:6px"><input type="text" id="rootInput" placeholder="追加するディレクトリのパス" style="flex:1;min-width:0;margin:0;font-size:11px"><button class="small" id="btnRootAdd">追加</button></div>
-      <div style="margin-top:6px">v__VERSION__ · <a href="#" id="btnHelp">キー操作</a></div>
+      <div id="rootAdd" style="display:flex;gap:4px;margin-top:6px"><input type="text" id="rootInput" data-i18n-placeholder="rootInput" style="flex:1;min-width:0;margin:0;font-size:11px"><button class="small" id="btnRootAdd" data-i18n="btnRootAdd"></button></div>
+      <div style="margin-top:6px">v__VERSION__ · <a href="#" id="btnHelp" data-i18n="btnHelp"></a></div>
     </div>
   </aside>
   <main id="main">
     <div id="topbar">
-      <button class="icon" id="btnSide" title="サイドバー切替">☰</button>
+      <button class="icon" id="btnSide" data-i18n-title="btnSide">☰</button>
       <span id="crumb" class="muted small"></span>
       <span class="sp" style="flex:1"></span>
-      <button id="btnRefresh" class="small" title="このプロジェクトのログを再読み込み">ログを更新</button>
+      <button id="btnRefresh" class="small" data-i18n="btnRefresh" data-i18n-title="btnRefreshTitle"></button>
     </div>
     <div id="scroll">
-      <div id="empty">左のリストからプロジェクトを選んでください</div>
+      <div id="empty" data-i18n="empty"></div>
       <div id="content" class="hidden">
         <header class="proj-head">
           <h2 id="projName"></h2>
@@ -1544,35 +1642,35 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
           <div id="projStats" class="muted small" style="margin-top:6px"></div>
         </header>
         <div class="toolbar">
-          <input type="search" id="q" placeholder="キーワード検索（スペース区切りで AND）  [/]">
+          <input type="search" id="q" data-i18n-placeholder="q">
           <select id="scope">
-            <option value="prompt">範囲: 依頼</option>
-            <option value="response">範囲: 応答</option>
-            <option value="all">範囲: 全体（推論・ツールログ含む）</option>
+            <option value="prompt" data-i18n="scopePrompt"></option>
+            <option value="response" data-i18n="scopeResponse"></option>
+            <option value="all" data-i18n="scopeAll"></option>
           </select>
           <span id="matchCount" class="small muted"></span>
-          <input type="date" id="dateFrom" title="開始日"> <span class="muted">〜</span> <input type="date" id="dateTo" title="終了日">
-          <label><input type="checkbox" id="pinOnly"> ピン留めのみ</label>
-          <label><input type="checkbox" id="humanOnly" checked> 依頼のあるターンのみ</label>
-          <label><input type="checkbox" id="showPeer" checked> 他エージェントからのメッセージ（畳んで表示）</label>
-          <label><input type="checkbox" id="showSys"> 通知・システム行を表示</label>
+          <input type="date" id="dateFrom" data-i18n-title="dateFrom"> <span class="muted">〜</span> <input type="date" id="dateTo" data-i18n-title="dateTo">
+          <label><input type="checkbox" id="pinOnly"> <span data-i18n="pinOnly"></span></label>
+          <label><input type="checkbox" id="humanOnly" checked> <span data-i18n="humanOnly"></span></label>
+          <label><input type="checkbox" id="showPeer" checked> <span data-i18n="showPeer"></span></label>
+          <label><input type="checkbox" id="showSys"> <span data-i18n="showSys"></span></label>
           <span style="flex-basis:100%;height:0"></span>
-          <button id="expandResp" class="small">応答を全展開</button>
-          <button id="expandDetail" class="small">詳細を全展開</button>
-          <button id="collapseAll" class="small">全て閉じる</button>
+          <button id="expandResp" class="small" data-i18n="expandResp"></button>
+          <button id="expandDetail" class="small" data-i18n="expandDetail"></button>
+          <button id="collapseAll" class="small" data-i18n="collapseAll"></button>
           <span class="sp" style="flex:1"></span>
           <div class="dropdown" id="exportDD">
-            <button class="small">書き出し / コピー ▾</button>
+            <button class="small" data-i18n="exportBtn"></button>
             <div class="menu">
-              <div class="muted small" style="padding:4px 10px">※ 現在の絞り込み結果が対象</div>
-              <button data-csv="prompts">CSV: 依頼のみ</button>
-              <button data-csv="pairs">CSV: 依頼と応答</button>
-              <button data-csv="full">CSV: 全体（推論・ツールログ含む）</button>
+              <div class="muted small" style="padding:4px 10px" data-i18n="exportNote"></div>
+              <button data-csv="prompts" data-i18n="csvPrompts"></button>
+              <button data-csv="pairs" data-i18n="csvPairs"></button>
+              <button data-csv="full" data-i18n="csvFull"></button>
               <hr>
-              <button data-md="prompts">Markdown をコピー: 依頼のみ</button>
-              <button data-md="pairs">Markdown をコピー: 依頼と応答</button>
+              <button data-md="prompts" data-i18n="mdPrompts"></button>
+              <button data-md="pairs" data-i18n="mdPairs"></button>
               <hr>
-              <button data-plain="prompts">プレーンテキストをコピー: 依頼のみ（1 行 1 依頼）</button>
+              <button data-plain="prompts" data-i18n="plainPrompts"></button>
             </div>
           </div>
         </div>
@@ -1581,21 +1679,109 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
     </div>
   </main>
 </div>
-<div id="loading"><div class="box" id="loadingMsg">読み込み中…</div></div>
-<div id="help">
-  <b>キー操作</b><br>
-  <span class="kbd">/</span> 検索 &nbsp; <span class="kbd">j</span>/<span class="kbd">k</span> 次/前のターン &nbsp;
-  <span class="kbd">o</span> 応答を開閉 &nbsp; <span class="kbd">d</span> 詳細を開閉 &nbsp;
-  <span class="kbd">p</span> ピン留め &nbsp; <span class="kbd">c</span> 依頼をコピー &nbsp; <span class="kbd">Esc</span> 検索クリア
-</div>
+<div id="loading"><div class="box" id="loadingMsg"></div></div>
+<div id="help"></div>
 <div id="toast"></div>
 <script>
 const EMBEDDED = __EMBEDDED__;
+const DEFAULT_LANG = '__LANG__';
 const $ = (s, el) => (el || document).querySelector(s);
 const $$ = (s, el) => Array.from((el || document).querySelectorAll(s));
-const KIND_LABEL = {typed:'依頼', queued:'依頼(割込)', command:'コマンド', shell:'シェル', peer:'他エージェント', continuation:'継続', auto:'自動'};
 const HUMAN_KINDS = new Set(['typed','queued','command','shell']);
-const STEP_LABEL = {text:'応答', thinking:'推論', tool:'ツール', notification:'通知', system:'システム', compact:'圧縮サマリー', compact_boundary:'圧縮', interrupt:'中断', meta:'コマンド展開', prompt:'指示'};
+const I18N = {
+ja: {
+  langBtn:'EN', btnMerge:'統合…', btnMergeTitle:'複数のプロジェクトを選んで 1 つに統合', btnReloadList:'プロジェクト一覧を再読み込み', projFilter:'プロジェクトを絞り込み',
+  mergeHint:'統合するプロジェクトにチェック（2 つ以上）', mergeName:'統合後の名前', btnMergeDo:'統合する', btnMergeCancel:'中止',
+  rootsTitle:'ログの場所', rootInput:'追加するディレクトリのパス', btnRootAdd:'追加', btnHelp:'キー操作', btnSide:'サイドバー切替',
+  btnRefresh:'ログを更新', btnRefreshTitle:'このプロジェクトのログを再読み込み', empty:'左のリストからプロジェクトを選んでください',
+  q:'キーワード検索（スペース区切りで AND）  [/]', scopePrompt:'範囲: 依頼', scopeResponse:'範囲: 応答', scopeAll:'範囲: 全体（推論・ツールログ含む）',
+  dateFrom:'開始日', dateTo:'終了日', pinOnly:'ピン留めのみ', humanOnly:'依頼のあるターンのみ', showPeer:'他エージェントからのメッセージ（畳んで表示）', showSys:'通知・システム行を表示',
+  expandResp:'応答を全展開', expandDetail:'詳細を全展開', collapseAll:'全て閉じる', exportBtn:'書き出し / コピー ▾', exportNote:'※ 現在の絞り込み結果が対象',
+  csvPrompts:'CSV: 依頼のみ', csvPairs:'CSV: 依頼と応答', csvFull:'CSV: 全体（推論・ツールログ含む）', mdPrompts:'Markdown をコピー: 依頼のみ', mdPairs:'Markdown をコピー: 依頼と応答', plainPrompts:'プレーンテキストをコピー: 依頼のみ（1 行 1 依頼）',
+  loading:'読み込み中…',
+  helpHtml:'<b>キー操作</b><br><span class="kbd">/</span> 検索 &nbsp; <span class="kbd">j</span>/<span class="kbd">k</span> 次/前のターン &nbsp; <span class="kbd">o</span> 応答を開閉 &nbsp; <span class="kbd">d</span> 詳細を開閉 &nbsp; <span class="kbd">p</span> ピン留め &nbsp; <span class="kbd">c</span> 依頼をコピー &nbsp; <span class="kbd">Esc</span> 検索クリア',
+  kinds:{typed:'依頼', queued:'依頼(割込)', command:'コマンド', shell:'シェル', peer:'他エージェント', continuation:'継続', auto:'自動'},
+  labels:{auto:'（プロンプトなしで開始）', continuation:'（前セッションからの継続）'},
+  steps:{text:'応答', thinking:'推論', tool:'ツール', notification:'通知', system:'システム', compact:'圧縮サマリー', compact_boundary:'圧縮', interrupt:'中断', meta:'コマンド展開', prompt:'指示'},
+  weekdays:'日月火水木金土', unknownDate:'日時不明',
+  sec:'{n}秒', minsec:'{m}分{s}秒', hourmin:'{h}時間{m}分',
+  copied:'コピーしました', copiedN:'コピーしました（{n} 文字）', copy:'コピー',
+  noEmbedded:'埋め込みデータにありません: ', fetchingDetails:'詳細ログを取得中… ({n} ターン)', fetchingProjects:'プロジェクト一覧を取得中…', loadFailed:'読み込みに失敗しました: ',
+  rootMissing:'（見つかりません。ドライブが外れている可能性）', rootRemove:'この場所を外す', rootAdding:'ログの場所を追加中…', updating:'更新中…', added:'追加しました', removed:'外しました', failed:'失敗: ',
+  suggestTitle:'統合候補（作業フォルダ名が同じ）', suggestRow:'{name} — {n} 件', merge:'統合', selectTitle:'候補を確認しながら選ぶ', select:'選択',
+  groupUpdating:'統合設定を更新中…', merged:'統合しました', unmerged:'統合を解除しました', updated:'更新しました',
+  groupBadge:'統合 {n}', pmeta:'{n} セッション · {size} · 最終 {date}', places:' · {n} か所',
+  parsing:'ログを解析中… 初回は大きなログで時間がかかります', groupProject:'統合プロジェクト', memberSessions:' （{n} セッション）',
+  rename:'名前を変更', renamePrompt:'統合プロジェクトの名前', unmerge:'統合を解除', unmergeConfirm:'統合を解除して元のプロジェクトに戻しますか？（ログは変更されません）',
+  allSessions:'すべてのセッション', chipTitle:'{id}\n{from} 〜 {to}\n依頼 {n} 件{cost}{compact}{cont}\n{file}', compactions:' · 圧縮 {n} 回', continuedIn:'\n→ 続き: ',
+  stats:'{sessions} セッション · 依頼 {prompts} 件 · ツール呼び出し {tools} 回 · {from} 〜 {to}', statsCost:' · 累計コスト ${cost}', statsRoots:' · ログの場所 ',
+  matched:'{n} 件一致', count:'{n} 件', noTurns:'該当するターンがありません', session:'セッション ', unfold:'展開', fold:'畳む',
+  images:'画像 {n}', interrupted:'中断', durationTitle:'所要時間', toolsTitle:'ツール呼び出し回数', modelTitle:'モデル', pinTitle:'ピン留め（ピックアップ）', copyPrompt:'⧉ 依頼',
+  showFull:'全文を表示', collapse:'折りたたむ', recap:'要約', responses:' 応答 ', details:' 詳細（推論・実行ログ） ', fetching:'取得中…', fetchFailed:'取得に失敗: ',
+  noTextResponse:'テキスト応答はありません（ツール実行のみ、または中断）', responsesN:'応答 {n} 件 ', copyAll:'⧉ すべてコピー',
+  error:'エラー', subagentN:'サブエージェント {n} 手', input:'入力', command:'コマンド', result:'結果', resultError:'結果（エラー）', copyResult:'⧉ 結果', emptyResult:'（空）', noResult:'結果なし（未完了または記録なし）',
+  subagentHead:'サブエージェント {type} {model}: {desc} · {from} 〜 {to}', noSteps:'記録された処理はありません', stepsHead:'ステップ {n}（ツール {tools} · 推論 {thinks}） ', openAll:'全て開く', closeAll:'全て閉じる', subagentLegacy:'サブエージェント {type}: {desc}',
+  csvHeadPrompts:['日時','セッション','種別','依頼'], csvHeadPairs:['日時','セッション','種別','依頼','応答日時','応答','要約','所要時間(秒)','ツール回数'], csvHeadFull:['日時','セッション','ターン番号','種類','名前','内容'],
+  csvPromptKind:'依頼({k})', csvToolCall:'ツール呼び出し', csvToolResult:'ツール結果', csvToolResultErr:'ツール結果(エラー)',
+  mdPromptsTitle:'依頼一覧', mdPairsTitle:'依頼と応答', mdRecap:'> 要約: ', mdResponse:'### 応答 ',
+  searching:'検索中…', searchFailed:'検索失敗: ', noMergeEmbedded:'書き出し版では統合できません', selectTwo:'2 つ以上選んでください',
+},
+en: {
+  langBtn:'日本語', btnMerge:'Merge…', btnMergeTitle:'Select several projects and merge them into one', btnReloadList:'Reload project list', projFilter:'Filter projects',
+  mergeHint:'Check the projects to merge (2 or more)', mergeName:'Name of merged project', btnMergeDo:'Merge', btnMergeCancel:'Cancel',
+  rootsTitle:'Log locations', rootInput:'Directory path to add', btnRootAdd:'Add', btnHelp:'Keys', btnSide:'Toggle sidebar',
+  btnRefresh:'Reload logs', btnRefreshTitle:'Re-read the logs of this project', empty:'Select a project from the list on the left',
+  q:'Search keywords (space = AND)  [/]', scopePrompt:'Scope: prompts', scopeResponse:'Scope: responses', scopeAll:'Scope: everything (incl. reasoning & tool logs)',
+  dateFrom:'From', dateTo:'To', pinOnly:'Pinned only', humanOnly:'Turns with a prompt only', showPeer:'Messages from other agents (folded)', showSys:'Show notification / system rows',
+  expandResp:'Expand all responses', expandDetail:'Expand all details', collapseAll:'Collapse all', exportBtn:'Export / Copy ▾', exportNote:'Applies to the current filtered result',
+  csvPrompts:'CSV: prompts only', csvPairs:'CSV: prompts and responses', csvFull:'CSV: everything (incl. reasoning & tool logs)', mdPrompts:'Copy Markdown: prompts only', mdPairs:'Copy Markdown: prompts and responses', plainPrompts:'Copy plain text: prompts only (one per line)',
+  loading:'Loading…',
+  helpHtml:'<b>Keyboard</b><br><span class="kbd">/</span> search &nbsp; <span class="kbd">j</span>/<span class="kbd">k</span> next/prev turn &nbsp; <span class="kbd">o</span> responses &nbsp; <span class="kbd">d</span> details &nbsp; <span class="kbd">p</span> pin &nbsp; <span class="kbd">c</span> copy prompt &nbsp; <span class="kbd">Esc</span> clear search',
+  kinds:{typed:'Prompt', queued:'Prompt (mid-turn)', command:'Command', shell:'Shell', peer:'Other agent', continuation:'Continued', auto:'Auto'},
+  labels:{auto:'(started without a prompt)', continuation:'(continued from previous session)'},
+  steps:{text:'Response', thinking:'Reasoning', tool:'Tool', notification:'Notice', system:'System', compact:'Compact summary', compact_boundary:'Compacted', interrupt:'Interrupted', meta:'Command expansion', prompt:'Instruction'},
+  weekdays:['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], unknownDate:'Unknown date',
+  sec:'{n}s', minsec:'{m}m {s}s', hourmin:'{h}h {m}m',
+  copied:'Copied', copiedN:'Copied ({n} chars)', copy:'Copy',
+  noEmbedded:'Not in embedded data: ', fetchingDetails:'Fetching details… ({n} turns)', fetchingProjects:'Fetching project list…', loadFailed:'Failed to load: ',
+  rootMissing:' (not found; the drive may be disconnected)', rootRemove:'Remove this location', rootAdding:'Adding log location…', updating:'Updating…', added:'Added', removed:'Removed', failed:'Failed: ',
+  suggestTitle:'Merge candidates (same working folder name)', suggestRow:'{name} — {n} projects', merge:'Merge', selectTitle:'Review candidates before merging', select:'Select',
+  groupUpdating:'Updating merge settings…', merged:'Merged', unmerged:'Unmerged', updated:'Updated',
+  groupBadge:'merged {n}', pmeta:'{n} sessions · {size} · last {date}', places:' · {n} locations',
+  parsing:'Parsing logs… large logs take a while the first time', groupProject:'Merged project', memberSessions:' ({n} sessions)',
+  rename:'Rename', renamePrompt:'Name of the merged project', unmerge:'Unmerge', unmergeConfirm:'Unmerge and restore the original projects? (Logs are not modified.)',
+  allSessions:'All sessions', chipTitle:'{id}\n{from} – {to}\n{n} prompts{cost}{compact}{cont}\n{file}', compactions:' · compacted {n}×', continuedIn:'\n→ continued in: ',
+  stats:'{sessions} sessions · {prompts} prompts · {tools} tool calls · {from} – {to}', statsCost:' · total cost ${cost}', statsRoots:' · locations ',
+  matched:'{n} matched', count:'{n}', noTurns:'No matching turns', session:'Session ', unfold:'Expand', fold:'Fold',
+  images:'{n} image(s)', interrupted:'Interrupted', durationTitle:'Duration', toolsTitle:'Tool calls', modelTitle:'Model', pinTitle:'Pin (pick up)', copyPrompt:'⧉ Prompt',
+  showFull:'Show full text', collapse:'Collapse', recap:'Recap', responses:' Responses ', details:' Details (reasoning & tool log) ', fetching:'Fetching…', fetchFailed:'Fetch failed: ',
+  noTextResponse:'No text response (tool calls only, or interrupted)', responsesN:'{n} response(s) ', copyAll:'⧉ Copy all',
+  error:'Error', subagentN:'Subagent, {n} steps', input:'Input', command:'Command', result:'Result', resultError:'Result (error)', copyResult:'⧉ Result', emptyResult:'(empty)', noResult:'No result (unfinished or not recorded)',
+  subagentHead:'Subagent {type} {model}: {desc} · {from} – {to}', noSteps:'No recorded steps', stepsHead:'{n} steps (tools {tools} · reasoning {thinks}) ', openAll:'Open all', closeAll:'Close all', subagentLegacy:'Subagent {type}: {desc}',
+  csvHeadPrompts:['Time','Session','Kind','Prompt'], csvHeadPairs:['Time','Session','Kind','Prompt','Response time','Response','Recap','Duration (s)','Tool calls'], csvHeadFull:['Time','Session','Turn','Type','Name','Content'],
+  csvPromptKind:'Prompt ({k})', csvToolCall:'Tool call', csvToolResult:'Tool result', csvToolResultErr:'Tool result (error)',
+  mdPromptsTitle:'Prompts', mdPairsTitle:'Prompts and responses', mdRecap:'> Recap: ', mdResponse:'### Response ',
+  searching:'Searching…', searchFailed:'Search failed: ', noMergeEmbedded:'Merging is not available in the exported version', selectTwo:'Select two or more',
+}};
+let LANG = (() => { try{ const v = localStorage.getItem('cldviewer.lang'); if(v && I18N[v]) return v; }catch(e){} return I18N[DEFAULT_LANG] ? DEFAULT_LANG : 'ja'; })();
+function tr(key, vars){ let s = I18N[LANG][key]; if(s == null) s = I18N.ja[key]; if(s == null) return key; if(typeof s !== 'string') return s; if(vars) for(const k in vars) s = s.split('{' + k + '}').join(vars[k]); return s; }
+function kindLabel(k){ return I18N[LANG].kinds[k] || k; }
+function turnLabel(t){ return t.labelKey ? (I18N[LANG].labels[t.labelKey] || t.labelKey) : (t.label || ''); }
+function stepLabel(k){ return I18N[LANG].steps[k] || k; }
+function applyI18n(){
+  document.documentElement.lang = LANG;
+  $$('[data-i18n]').forEach(e => e.textContent = tr(e.dataset.i18n));
+  $$('[data-i18n-placeholder]').forEach(e => e.placeholder = tr(e.dataset.i18nPlaceholder));
+  $$('[data-i18n-title]').forEach(e => e.title = tr(e.dataset.i18nTitle));
+  $('#btnLang').textContent = tr('langBtn');
+  $('#help').innerHTML = tr('helpHtml');
+  $('#loadingMsg').textContent = tr('loading');
+}
+function setLang(l){
+  LANG = l; try{ localStorage.setItem('cldviewer.lang', l); }catch(e){}
+  applyI18n(); renderRoots(); renderSuggestions(); renderProjectList();
+  if(state.project) renderProject();
+}
 const SESSION_COLORS = ['--s1','--s2','--s3','--s4','--s5','--s6','--s7','--s8'];
 
 const state = {
@@ -1609,9 +1795,9 @@ function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&
 function pad(n){ return n < 10 ? '0' + n : '' + n; }
 function fmtDT(ts){ if(!ts) return ''; const d = new Date(ts); if(isNaN(d)) return ts; return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }
 function fmtT(ts){ if(!ts) return ''; const d = new Date(ts); if(isNaN(d)) return ''; return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }
-function fmtDay(ts){ if(!ts) return '日時不明'; const d = new Date(ts); if(isNaN(d)) return '日時不明'; return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' ('+'日月火水木金土'[d.getDay()]+')'; }
+function fmtDay(ts){ if(!ts) return tr('unknownDate'); const d = new Date(ts); if(isNaN(d)) return tr('unknownDate'); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' ('+tr('weekdays')[d.getDay()]+')'; }
 function dayKey(ts){ if(!ts) return ''; const d = new Date(ts); if(isNaN(d)) return ''; return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
-function fmtDur(ms){ if(ms == null) return ''; const s = Math.round(ms/1000); if(s < 60) return s+'秒'; const m = Math.floor(s/60); if(m < 60) return m+'分'+pad(s%60)+'秒'; return Math.floor(m/60)+'時間'+pad(m%60)+'分'; }
+function fmtDur(ms){ if(ms == null) return ''; const s = Math.round(ms/1000); if(s < 60) return tr('sec', {n: s}); const m = Math.floor(s/60); if(m < 60) return tr('minsec', {m, s: pad(s%60)}); return tr('hourmin', {h: Math.floor(m/60), m: pad(m%60)}); }
 function fmtBytes(b){ return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : b > 1e6 ? (b/1e6).toFixed(1)+' MB' : Math.round(b/1e3)+' KB'; }
 function el(tag, attrs, ...children){
   const e = document.createElement(tag);
@@ -1623,11 +1809,11 @@ function toast(msg){ const t = $('#toast'); t.textContent = msg; t.classList.add
 async function copyText(text, btn){
   try{ await navigator.clipboard.writeText(text); }
   catch(e){ const ta = el('textarea'); ta.value = text; ta.style.position='fixed'; ta.style.opacity='0'; document.body.append(ta); ta.select(); try{ document.execCommand('copy'); }catch(_){} ta.remove(); }
-  toast('コピーしました' + (text.length > 60 ? '（' + text.length + ' 文字）' : ''));
+  toast(text.length > 60 ? tr('copiedN', {n: text.length}) : tr('copied'));
   if(btn){ const o = btn.textContent; btn.textContent = '✓'; setTimeout(() => btn.textContent = o, 900); }
 }
-function copyBtn(getText, label){ const b = el('button', {class:'icon', title:'コピー'}, label || '⧉'); b.addEventListener('click', ev => { ev.stopPropagation(); copyText(typeof getText === 'function' ? getText() : getText, b); }); return b; }
-function showLoading(msg){ $('#loadingMsg').textContent = msg || '読み込み中…'; $('#loading').classList.add('show'); }
+function copyBtn(getText, label){ const b = el('button', {class:'icon', title: tr('copy')}, label || '⧉'); b.addEventListener('click', ev => { ev.stopPropagation(); copyText(typeof getText === 'function' ? getText() : getText, b); }); return b; }
+function showLoading(msg){ $('#loadingMsg').textContent = msg || tr('loading'); $('#loading').classList.add('show'); }
 function hideLoading(){ $('#loading').classList.remove('show'); }
 function download(name, text, mime){ const a = el('a', {href: URL.createObjectURL(new Blob([text], {type: mime || 'text/plain;charset=utf-8'})), download: name}); document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
 
@@ -1710,7 +1896,7 @@ async function apiProjects(){
   const r = await fetch('/api/projects'); if(!r.ok) throw new Error('projects: ' + r.status); return r.json();
 }
 async function apiProject(id, refresh){
-  if(EMBEDDED){ const p = EMBEDDED.data[id]; if(!p) throw new Error('埋め込みデータにありません: ' + id); return p; }
+  if(EMBEDDED){ const p = EMBEDDED.data[id]; if(!p) throw new Error(tr('noEmbedded') + id); return p; }
   const r = await fetch('/api/project/' + encodeURIComponent(id) + (refresh ? '?refresh=1' : ''));
   if(!r.ok) throw new Error('project: ' + r.status); return r.json();
 }
@@ -1726,7 +1912,7 @@ async function ensureDetails(turns){
   const need = turns.filter(t => !t.steps);
   if(!need.length) return;
   if(EMBEDDED){ for(const t of need){ t.steps = []; t.agents = []; } return; }
-  showLoading('詳細ログを取得中… (' + need.length + ' ターン)');
+  showLoading(tr('fetchingDetails', {n: need.length}));
   try{
     for(let i = 0; i < need.length; i += 200){
       const chunk = need.slice(i, i + 200);
@@ -1740,23 +1926,23 @@ function savePins(){ try{ localStorage.setItem('cldviewer.pins.' + state.pid, JS
 
 // ------------------------------------------------------------ project list
 async function loadProjects(){
-  showLoading('プロジェクト一覧を取得中…');
+  showLoading(tr('fetchingProjects'));
   try{ const r = await apiProjects(); applyProjects(r); }
-  catch(e){ alert('読み込みに失敗しました: ' + e.message); }
+  catch(e){ alert(tr('loadFailed') + e.message); }
   finally{ hideLoading(); }
 }
 function renderRoots(){
   const box = $('#roots'); box.innerHTML = '';
   for(const r of state.roots){
-    const row = el('div', {class:'rootrow' + (r.ok ? '' : ' ng'), title: r.ok ? r.path : r.path + '（見つかりません。ドライブが外れている可能性）'}, el('span', {class:'rp'}, r.path));
-    if(r.saved && !EMBEDDED) row.append(el('button', {class:'icon', title:'この場所を外す', onclick: () => changeRoot('remove', r.path)}, '×'));
+    const row = el('div', {class:'rootrow' + (r.ok ? '' : ' ng'), title: r.ok ? r.path : r.path + tr('rootMissing')}, el('span', {class:'rp'}, r.path));
+    if(r.saved && !EMBEDDED) row.append(el('button', {class:'icon', title: tr('rootRemove'), onclick: () => changeRoot('remove', r.path)}, '×'));
     box.append(row);
   }
   $('#rootAdd').classList.toggle('hidden', !!EMBEDDED);
 }
 async function changeRoot(action, path){
   if(!path) return;
-  showLoading(action === 'add' ? 'ログの場所を追加中…' : '更新中…');
+  showLoading(action === 'add' ? tr('rootAdding') : tr('updating'));
   try{
     const r = await fetch('/api/roots', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action, path})});
     const j = await r.json();
@@ -1764,8 +1950,8 @@ async function changeRoot(action, path){
     state.roots = j.roots; state.projects = j.projects; renderRoots(); renderProjectList();
     if(action === 'add') $('#rootInput').value = '';
     if(state.pid){ if(state.projects.some(p => p.id === state.pid)) selectProject(state.pid, true); else { state.project = null; state.pid = null; $('#content').classList.add('hidden'); $('#empty').classList.remove('hidden'); } }
-    toast(action === 'add' ? '追加しました' : '外しました');
-  }catch(e){ alert('失敗: ' + e.message); }
+    toast(action === 'add' ? tr('added') : tr('removed'));
+  }catch(e){ alert(tr('failed') + e.message); }
   finally{ hideLoading(); }
 }
 function applyProjects(r){
@@ -1777,18 +1963,18 @@ function renderSuggestions(){
   const list = (state.suggestions || []).filter(s => !state.mergeMode);
   box.classList.toggle('hidden', !list.length || !!EMBEDDED);
   if(!list.length) return;
-  box.append(el('div', {class:'muted', style:'margin-bottom:2px'}, '統合候補（作業フォルダ名が同じ）'));
+  box.append(el('div', {class:'muted', style:'margin-bottom:2px'}, tr('suggestTitle')));
   for(const s of list){
     box.append(el('div', {class:'srow'},
-      el('span', {class:'sn', title: s.members.map(m => m.path).join('\n')}, `${s.name} — ${s.members.length} 件`),
-      el('button', {class:'small', onclick: () => changeGroup({action:'create', name: s.name, members: s.members.map(m => m.id)})}, '統合'),
-      el('button', {class:'icon', title:'候補を確認しながら選ぶ', onclick: () => { enterMerge(); for(const m of s.members) state.mergeSel.add(m.id); $('#mergeName').value = s.name; renderProjectList(); }}, '選択')));
+      el('span', {class:'sn', title: s.members.map(m => m.path).join('\n')}, tr('suggestRow', {name: s.name, n: s.members.length})),
+      el('button', {class:'small', onclick: () => changeGroup({action:'create', name: s.name, members: s.members.map(m => m.id)})}, tr('merge')),
+      el('button', {class:'icon', title: tr('selectTitle'), onclick: () => { enterMerge(); for(const m of s.members) state.mergeSel.add(m.id); $('#mergeName').value = s.name; renderProjectList(); }}, tr('select'))));
   }
 }
 function enterMerge(){ state.mergeMode = true; state.mergeSel = new Set(); $('#mergeBar').classList.remove('hidden'); $('#btnMerge').classList.add('on'); renderSuggestions(); renderProjectList(); }
 function exitMerge(){ state.mergeMode = false; state.mergeSel = new Set(); $('#mergeBar').classList.add('hidden'); $('#btnMerge').classList.remove('on'); $('#mergeName').value = ''; renderSuggestions(); renderProjectList(); }
 async function changeGroup(payload){
-  showLoading('統合設定を更新中…');
+  showLoading(tr('groupUpdating'));
   try{
     const r = await fetch('/api/groups', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     const j = await r.json();
@@ -1798,8 +1984,8 @@ async function changeGroup(payload){
     if(payload.action === 'create' && j.id) await selectProject(j.id, true);
     else if(payload.action === 'delete'){ state.project = null; state.pid = null; $('#content').classList.add('hidden'); $('#empty').classList.remove('hidden'); location.hash = ''; renderProjectList(); }
     else if(state.pid) await selectProject(state.pid, true);
-    toast(payload.action === 'create' ? '統合しました' : payload.action === 'delete' ? '統合を解除しました' : '更新しました');
-  }catch(e){ alert('失敗: ' + e.message); }
+    toast(payload.action === 'create' ? tr('merged') : payload.action === 'delete' ? tr('unmerged') : tr('updated'));
+  }catch(e){ alert(tr('failed') + e.message); }
   finally{ hideLoading(); }
 }
 function renderProjectList(){
@@ -1809,9 +1995,9 @@ function renderProjectList(){
     const hay = (p.name + ' ' + p.path + ' ' + (p.members || []).map(m => m.path).join(' ')).toLowerCase();
     if(f && !hay.includes(f)) continue;
     const body = el('div', {class:'body'},
-      el('div', {class:'pname'}, p.name, p.group ? el('span', {class:'badge group', style:'margin-left:6px'}, '統合 ' + p.members.length) : null),
+      el('div', {class:'pname'}, p.name, p.group ? el('span', {class:'badge group', style:'margin-left:6px'}, tr('groupBadge', {n: p.members.length})) : null),
       p.group ? null : el('div', {class:'ppath'}, p.path),
-      el('div', {class:'pmeta'}, `${p.sessionCount} セッション · ${fmtBytes(p.bytes)} · 最終 ${fmtDT(p.lastModified).slice(0,16)}${(p.roots || []).length > 1 ? ' · ' + p.roots.length + ' か所' : ''}`));
+      el('div', {class:'pmeta'}, tr('pmeta', {n: p.sessionCount, size: fmtBytes(p.bytes), date: fmtDT(p.lastModified).slice(0,16)}) + ((p.roots || []).length > 1 ? tr('places', {n: p.roots.length}) : '')));
     if(p.group) for(const m of p.members) body.append(el('div', {class:'pmember', title: m.path}, '└ ' + m.path));
     const li = el('li', {class: (p.id === state.pid ? 'active' : '') + (state.mergeMode ? ' sel' : ''), title: p.group ? p.members.map(m => m.path).join('\n') : p.path});
     if(state.mergeMode){
@@ -1826,7 +2012,7 @@ function renderProjectList(){
 
 // ------------------------------------------------------------ project
 async function selectProject(pid, refresh){
-  showLoading('ログを解析中… 初回は大きなログで時間がかかります');
+  showLoading(tr('parsing'));
   try{
     const p = await apiProject(pid, refresh);
     state.project = p; state.pid = pid; state.sessionFilter = null; state.open = {}; state.pins = loadPins(pid);
@@ -1834,7 +2020,7 @@ async function selectProject(pid, refresh){
     location.hash = 'p=' + encodeURIComponent(pid);
     renderProjectList();
     renderProject();
-  }catch(e){ alert('読み込みに失敗しました: ' + e.message); }
+  }catch(e){ alert(tr('loadFailed') + e.message); }
   finally{ hideLoading(); }
 }
 function sessionIndex(sid){ return state.project.sessions.findIndex(s => s.id === sid); }
@@ -1844,21 +2030,21 @@ function sessionLabel(sid){ const i = sessionIndex(sid); return 'S' + (i + 1); }
 function renderProject(){
   const p = state.project;
   $('#empty').classList.add('hidden'); $('#content').classList.remove('hidden');
-  $('#projName').textContent = p.name; $('#projPath').textContent = p.group ? '統合プロジェクト' : p.path; $('#crumb').textContent = p.name;
+  $('#projName').textContent = p.name; $('#projPath').textContent = p.group ? tr('groupProject') : p.path; $('#crumb').textContent = p.name;
   const gi = $('#groupInfo'); gi.innerHTML = ''; gi.classList.toggle('hidden', !p.group);
   if(p.group){
-    p.members.forEach((m, i) => gi.append(el('div', {class:'gm'}, el('span', {class:'badge'}, '📂' + (i+1)), ' ' + m.path + ` （${m.sessionCount} セッション）`)));
+    p.members.forEach((m, i) => gi.append(el('div', {class:'gm'}, el('span', {class:'badge'}, '📂' + (i+1)), ' ' + m.path + tr('memberSessions', {n: m.sessionCount}))));
     if(!EMBEDDED) gi.append(el('div', {style:'margin-top:4px;display:flex;gap:6px'},
-      el('button', {class:'small', onclick: () => { const n = prompt('統合プロジェクトの名前', p.name); if(n != null && n.trim()) changeGroup({action:'rename', id: p.id, name: n}); }}, '名前を変更'),
-      el('button', {class:'small', onclick: () => { if(confirm('統合を解除して元のプロジェクトに戻しますか？（ログは変更されません）')) changeGroup({action:'delete', id: p.id}); }}, '統合を解除')));
+      el('button', {class:'small', onclick: () => { const n = prompt(tr('renamePrompt'), p.name); if(n != null && n.trim()) changeGroup({action:'rename', id: p.id, name: n}); }}, tr('rename')),
+      el('button', {class:'small', onclick: () => { if(confirm(tr('unmergeConfirm'))) changeGroup({action:'delete', id: p.id}); }}, tr('unmerge'))));
   }
   const chips = $('#sessionChips'); chips.innerHTML = '';
-  const all = el('button', {class:'chip' + (state.sessionFilter ? '' : ' on'), onclick: () => { state.sessionFilter = null; renderProject(); }}, 'すべてのセッション');
+  const all = el('button', {class:'chip' + (state.sessionFilter ? '' : ' on'), onclick: () => { state.sessionFilter = null; renderProject(); }}, tr('allSessions'));
   chips.append(all);
   p.sessions.forEach((s, i) => {
     const turns = p.turns.filter(t => t.sid === s.id && HUMAN_KINDS.has(t.kind)).length;
     const cost = s.cost && s.cost.usd != null ? ' · $' + s.cost.usd.toFixed(2) : '';
-    const title = `${s.id}\n${fmtDT(s.firstTs)} 〜 ${fmtDT(s.lastTs)}\n依頼 ${turns} 件${cost}${s.compactions ? ' · 圧縮 ' + s.compactions + ' 回' : ''}${s.continuedIn ? '\n→ 続き: ' + s.continuedIn : ''}\n${s.file}`;
+    const title = tr('chipTitle', {id: s.id, from: fmtDT(s.firstTs), to: fmtDT(s.lastTs), n: turns, cost, compact: s.compactions ? tr('compactions', {n: s.compactions}) : '', cont: s.continuedIn ? tr('continuedIn') + s.continuedIn : '', file: s.file});
     const multi = (p.roots || []).length > 1;
     const mi = p.group ? p.members.findIndex(m => m.id === s.projectDir) : -1;
     const c = el('button', {class:'chip' + (state.sessionFilter === s.id ? ' on' : ''), title, onclick: () => { state.sessionFilter = state.sessionFilter === s.id ? null : s.id; renderProject(); }},
@@ -1871,7 +2057,7 @@ function renderProject(){
   const first = p.turns.length ? p.turns[0].ts : null, last = p.turns.length ? p.turns[p.turns.length-1].endTs || p.turns[p.turns.length-1].ts : null;
   const cost = p.sessions.reduce((a, s) => a + ((s.cost && s.cost.usd) || 0), 0);
   const tools = p.turns.reduce((a, t) => a + (t.toolCount || 0), 0);
-  $('#projStats').textContent = `${p.sessions.length} セッション · 依頼 ${human.length} 件 · ツール呼び出し ${tools} 回 · ${fmtDT(first).slice(0,10)} 〜 ${fmtDT(last).slice(0,10)}${cost ? ' · 累計コスト $' + cost.toFixed(2) : ''}${(p.roots || []).length > 1 ? ' · ログの場所 ' + p.roots.map((r, i) => '📁' + (i+1) + ' ' + r).join('  ') : ''}`;
+  $('#projStats').textContent = tr('stats', {sessions: p.sessions.length, prompts: human.length, tools, from: fmtDT(first).slice(0,10), to: fmtDT(last).slice(0,10)}) + (cost ? tr('statsCost', {cost: cost.toFixed(2)}) : '') + ((p.roots || []).length > 1 ? tr('statsRoots') + p.roots.map((r, i) => '📁' + (i+1) + ' ' + r).join('  ') : '');
   renderTimeline();
 }
 
@@ -1918,13 +2104,13 @@ function renderTimeline(){
   const tl = $('#timeline'); tl.innerHTML = '';
   const turns = visibleTurns();
   const hasQ = state.terms.length > 0;
-  $('#matchCount').textContent = hasQ ? `${turns.length} 件一致` : `${turns.length} 件`;
+  $('#matchCount').textContent = hasQ ? tr('matched', {n: turns.length}) : tr('count', {n: turns.length});
   let lastDay = null; let dayCount = 0; let dayHead = null;
   const frag = document.createDocumentFragment();
   for(const t of turns){
     const dk = dayKey(t.ts);
     if(dk !== lastDay){
-      if(dayHead) dayHead.querySelector('.cnt').textContent = dayCount + ' 件';
+      if(dayHead) dayHead.querySelector('.cnt').textContent = tr('count', {n: dayCount});
       dayHead = el('div', {class:'dayhead'}, fmtDay(t.ts), el('span', {class:'cnt'}, ''));
       frag.append(dayHead); lastDay = dk; dayCount = 0;
     }
@@ -1932,8 +2118,8 @@ function renderTimeline(){
     if(hasQ){ const o = state.open[t.id] || (state.open[t.id] = {}); if(state.scope === 'response') o.r = true; if(state.scope === 'all') o.d = true; }
     frag.append(renderTurn(t));
   }
-  if(dayHead) dayHead.querySelector('.cnt').textContent = dayCount + ' 件';
-  if(!turns.length) frag.append(el('div', {class:'muted', style:'padding:30px;text-align:center'}, '該当するターンがありません'));
+  if(dayHead) dayHead.querySelector('.cnt').textContent = tr('count', {n: dayCount});
+  if(!turns.length) frag.append(el('div', {class:'muted', style:'padding:30px;text-align:center'}, tr('noTurns')));
   tl.append(frag);
 }
 function renderTurn(t){
@@ -1942,42 +2128,42 @@ function renderTurn(t){
   const card = el('article', {class:'turn kind-' + t.kind + (state.pins.has(t.id) ? ' pinned' : '') + (state.terms.length ? ' match' : '') + (folded ? ' folded' : ''), id:'t-' + t.id, tabindex:0, 'data-id': t.id});
   const head = el('div', {class:'thead'},
     el('span', {class:'time', title: t.ts}, fmtT(t.ts)),
-    el('span', {class:'badge kind-' + t.kind}, (KIND_LABEL[t.kind] || t.kind) + (t.sender ? ': ' + t.sender : '')),
-    el('span', {class:'schip', title: 'セッション ' + t.sid}, el('span', {class:'dot', style:'background:' + sessionColor(t.sid)}), sessionLabel(t.sid)),
+    el('span', {class:'badge kind-' + t.kind}, kindLabel(t.kind) + (t.sender ? ': ' + t.sender : '')),
+    el('span', {class:'schip', title: tr('session') + t.sid}, el('span', {class:'dot', style:'background:' + sessionColor(t.sid)}), sessionLabel(t.sid)),
   );
   if(t.kind === 'peer'){
-    const tog = el('button', {class:'icon', title: folded ? '展開' : '畳む', onclick: ev => { ev.stopPropagation(); const oo = state.open[t.id] || (state.open[t.id] = {}); oo.unfold = !oo.unfold; card.replaceWith(renderTurn(t)); }}, folded ? '▸' : '▾');
+    const tog = el('button', {class:'icon', title: folded ? tr('unfold') : tr('fold'), onclick: ev => { ev.stopPropagation(); const oo = state.open[t.id] || (state.open[t.id] = {}); oo.unfold = !oo.unfold; card.replaceWith(renderTurn(t)); }}, folded ? '▸' : '▾');
     head.prepend(tog);
     if(folded){ head.append(el('span', {class:'preview muted'}, (t.prompt || '').split('\n').find(l => l.trim()) || '')); head.addEventListener('click', ev => { if(ev.target.closest('button')) return; tog.click(); }); }
   }
-  if(t.images) head.append(el('span', {class:'badge'}, '画像 ' + t.images));
-  if(t.interrupted) head.append(el('span', {class:'badge err'}, '中断'));
+  if(t.images) head.append(el('span', {class:'badge'}, tr('images', {n: t.images})));
+  if(t.interrupted) head.append(el('span', {class:'badge err'}, tr('interrupted')));
   const meta = el('span', {class:'meta'});
-  if(t.durationMs != null) meta.append(el('span', {title:'所要時間'}, '⏱ ' + fmtDur(t.durationMs)));
-  if(t.toolCount) meta.append(el('span', {title:'ツール呼び出し回数'}, '🔧 ' + t.toolCount));
-  if(t.model) meta.append(el('span', {title:'モデル'}, t.model.replace(/^claude-/, '')));
-  const pinB = el('button', {class:'icon', title:'ピン留め（ピックアップ）', onclick: ev => { ev.stopPropagation(); togglePin(t, card); }}, state.pins.has(t.id) ? '★' : '☆');
+  if(t.durationMs != null) meta.append(el('span', {title: tr('durationTitle')}, '⏱ ' + fmtDur(t.durationMs)));
+  if(t.toolCount) meta.append(el('span', {title: tr('toolsTitle')}, '🔧 ' + t.toolCount));
+  if(t.model) meta.append(el('span', {title: tr('modelTitle')}, t.model.replace(/^claude-/, '')));
+  const pinB = el('button', {class:'icon', title: tr('pinTitle'), onclick: ev => { ev.stopPropagation(); togglePin(t, card); }}, state.pins.has(t.id) ? '★' : '☆');
   pinB.style.color = state.pins.has(t.id) ? 'var(--pin)' : '';
-  meta.append(pinB, copyBtn(() => t.prompt, '⧉ 依頼'));
+  meta.append(pinB, copyBtn(() => t.prompt, tr('copyPrompt')));
   head.append(meta);
   card.append(head);
 
-  const ptext = t.prompt || t.label || '';
+  const ptext = t.prompt || turnLabel(t);
   const prompt = el('div', {class:'prompt', html: hl(ptext)});
   const long = ptext.length > 500 || (ptext.match(/\n/g) || []).length > 7;
-  if(long && !state.terms.length){ prompt.classList.add('clamp'); const mb = el('button', {class:'morebtn small', onclick: () => { const c = prompt.classList.toggle('clamp'); mb.textContent = c ? '全文を表示' : '折りたたむ'; }}, '全文を表示'); card.append(prompt, mb); }
+  if(long && !state.terms.length){ prompt.classList.add('clamp'); const mb = el('button', {class:'morebtn small', onclick: () => { const c = prompt.classList.toggle('clamp'); mb.textContent = c ? tr('showFull') : tr('collapse'); }}, tr('showFull')); card.append(prompt, mb); }
   else card.append(prompt);
-  if(t.recap) card.append(el('div', {class:'recap', html: '<b>要約</b>' + hl(t.recap)}));
+  if(t.recap) card.append(el('div', {class:'recap', html: '<b>' + tr('recap') + '</b>' + hl(t.recap)}));
 
   const nResp = t.responses.length, nSteps = t.stepCount != null ? t.stepCount : (t.steps || []).length;
-  const btnR = el('button', {class:'small' + (o.r ? ' on' : ''), onclick: () => toggle(t, card, 'r')}, (o.r ? '▾' : '▸') + ' 応答 ' + nResp);
-  const btnD = el('button', {class:'small' + (o.d ? ' on' : ''), onclick: () => toggle(t, card, 'd')}, (o.d ? '▾' : '▸') + ' 詳細（推論・実行ログ） ' + nSteps);
+  const btnR = el('button', {class:'small' + (o.r ? ' on' : ''), onclick: () => toggle(t, card, 'r')}, (o.r ? '▾' : '▸') + tr('responses') + nResp);
+  const btnD = el('button', {class:'small' + (o.d ? ' on' : ''), onclick: () => toggle(t, card, 'd')}, (o.d ? '▾' : '▸') + tr('details') + nSteps);
   const btns = el('div', {class:'tbtns'}, btnR, btnD, el('span', {class:'sp'}), el('span', {class:'muted small', title: t.ts}, fmtDT(t.ts)));
   card.append(btns);
   const pr = el('div', {class:'panel panel-r' + (o.r ? '' : ' hidden')}); const pd = el('div', {class:'panel panel-d' + (o.d ? '' : ' hidden')});
   card.append(pr, pd);
   if(o.r) fillResponses(t, pr);
-  if(o.d){ if(t.steps) fillDetails(t, pd); else { pd.textContent = '取得中…'; ensureDetails([t]).then(() => fillDetails(t, pd)).catch(e => pd.textContent = '取得に失敗: ' + e.message); } }
+  if(o.d){ if(t.steps) fillDetails(t, pd); else { pd.textContent = tr('fetching'); ensureDetails([t]).then(() => fillDetails(t, pd)).catch(e => pd.textContent = tr('fetchFailed') + e.message); } }
   return card;
 }
 async function toggle(t, card, which){
@@ -1989,7 +2175,7 @@ async function toggle(t, card, which){
   panel.classList.toggle('hidden', !o[which]);
   if(o[which] && !panel.childNodes.length){
     if(which === 'r') fillResponses(t, panel);
-    else { if(!t.steps){ panel.textContent = '取得中…'; try{ await ensureDetails([t]); }catch(e){ panel.textContent = '取得に失敗: ' + e.message; return; } } fillDetails(t, panel); }
+    else { if(!t.steps){ panel.textContent = tr('fetching'); try{ await ensureDetails([t]); }catch(e){ panel.textContent = tr('fetchFailed') + e.message; return; } } fillDetails(t, panel); }
   }
 }
 function togglePin(t, card){
@@ -2001,9 +2187,9 @@ function togglePin(t, card){
 }
 function fillResponses(t, panel){
   panel.innerHTML = '';
-  if(!t.responses.length){ panel.append(el('div', {class:'muted small'}, 'テキスト応答はありません（ツール実行のみ、または中断）')); return; }
+  if(!t.responses.length){ panel.append(el('div', {class:'muted small'}, tr('noTextResponse'))); return; }
   const all = () => t.responses.map(r => r.text).join('\n\n');
-  panel.append(el('h4', null, '応答 ' + t.responses.length + ' 件 ', copyBtn(all, '⧉ すべてコピー')));
+  panel.append(el('h4', null, tr('responsesN', {n: t.responses.length}), copyBtn(all, tr('copyAll'))));
   t.responses.forEach((r, i) => {
     const body = el('div', {class:'md', html: md(r.text)}); hlNode(body);
     panel.append(el('div', {class:'resp'}, el('div', {class:'rhead'}, el('span', null, '#' + (i+1)), el('span', {title: r.ts}, fmtDT(r.ts)), el('span', {class:'sp'}), copyBtn(() => r.text)), body));
@@ -2022,26 +2208,26 @@ function renderStep(s, depth){
   if(!showSys && (s.kind === 'notification' || s.kind === 'system' || s.kind === 'meta')) return null;
   if(s.kind === 'compact_boundary') return el('div', {class:'step s-compact_boundary'}, '— ' + s.text + ' —');
   const step = el('div', {class:'step s-' + s.kind});
-  const head = el('div', {class:'shead'}, el('span', {class:'tri'}, '▸'), el('span', {class:'badge'}, STEP_LABEL[s.kind] || s.kind));
+  const head = el('div', {class:'shead'}, el('span', {class:'tri'}, '▸'), el('span', {class:'badge'}, stepLabel(s.kind)));
   const body = el('div', {class:'sbody'});
   head.addEventListener('click', ev => { if(ev.target.closest('button')) return; step.classList.toggle('open'); head.querySelector('.tri').textContent = step.classList.contains('open') ? '▾' : '▸'; });
   if(s.kind === 'tool'){
     const inputStr = typeof s.input === 'string' ? s.input : JSON.stringify(s.input || {}, null, 2);
     const cmd = s.input && typeof s.input === 'object' && typeof s.input.command === 'string' ? s.input.command : null;
     head.append(el('span', {class:'name'}, s.name || '?'), el('span', {class:'sum', html: hl(toolSummary(s))}));
-    if(s.isError) head.append(el('span', {class:'badge err'}, 'エラー'));
-    if(s.subagent) head.append(el('span', {class:'badge'}, 'サブエージェント ' + (s.subagent.steps.length) + ' 手'));
+    if(s.isError) head.append(el('span', {class:'badge err'}, tr('error')));
+    if(s.subagent) head.append(el('span', {class:'badge'}, tr('subagentN', {n: s.subagent.steps.length})));
     const dur = s.resultTs && s.ts ? new Date(s.resultTs) - new Date(s.ts) : null;
     head.append(el('span', {class:'stime', title: s.ts}, fmtT(s.ts) + (dur != null && dur >= 0 ? ' · ' + fmtDur(dur) : '')));
-    body.append(el('div', {class:'lab'}, '入力', el('span', {class:'sp'}), copyBtn(() => cmd != null ? cmd : inputStr, '⧉ ' + (cmd != null ? 'コマンド' : '入力'))));
+    body.append(el('div', {class:'lab'}, tr('input'), el('span', {class:'sp'}), copyBtn(() => cmd != null ? cmd : inputStr, '⧉ ' + (cmd != null ? tr('command') : tr('input')))));
     body.append(el('pre', {html: hl(cmd != null && Object.keys(s.input).length <= 2 ? cmd + (s.input.description ? '\n# ' + s.input.description : '') : inputStr)}));
     if(s.result != null){
-      body.append(el('div', {class:'lab'}, '結果' + (s.isError ? '（エラー）' : ''), el('span', {class:'sp'}), s.resultTs ? el('span', null, fmtT(s.resultTs)) : null, copyBtn(() => s.result, '⧉ 結果')));
-      body.append(el('pre', {html: hl(s.result || '（空）')}));
-    } else body.append(el('div', {class:'lab'}, '結果なし（未完了または記録なし）'));
+      body.append(el('div', {class:'lab'}, s.isError ? tr('resultError') : tr('result'), el('span', {class:'sp'}), s.resultTs ? el('span', null, fmtT(s.resultTs)) : null, copyBtn(() => s.result, tr('copyResult'))));
+      body.append(el('pre', {html: hl(s.result || tr('emptyResult'))}));
+    } else body.append(el('div', {class:'lab'}, tr('noResult')));
     if(s.subagent){
       const a = s.subagent;
-      const sub = el('div', {class:'subagent'}, el('div', {class:'lab'}, `サブエージェント ${a.type || ''} ${a.model ? '(' + a.model + ')' : ''}: ${a.description || ''} · ${fmtDT(a.firstTs)} 〜 ${fmtT(a.lastTs)}`));
+      const sub = el('div', {class:'subagent'}, el('div', {class:'lab'}, tr('subagentHead', {type: a.type || '', model: a.model ? '(' + a.model + ')' : '', desc: a.description || '', from: fmtDT(a.firstTs), to: fmtT(a.lastTs)})));
       for(const ss of a.steps){ const n = renderStep(ss, (depth || 0) + 1); if(n) sub.append(n); }
       body.append(sub);
     }
@@ -2059,15 +2245,15 @@ function renderStep(s, depth){
 }
 function fillDetails(t, panel){
   panel.innerHTML = '';
-  if(!(t.steps || []).length && !(t.agents || []).length){ panel.append(el('div', {class:'muted small'}, '記録された処理はありません')); return; }
+  if(!(t.steps || []).length && !(t.agents || []).length){ panel.append(el('div', {class:'muted small'}, tr('noSteps'))); return; }
   const tools = t.steps.filter(s => s.kind === 'tool').length, thinks = t.steps.filter(s => s.kind === 'thinking').length;
-  const h = el('h4', null, `ステップ ${t.steps.length}（ツール ${tools} · 推論 ${thinks}） `);
-  const openAll = el('button', {class:'icon small', onclick: () => { const on = !panel._allOpen; panel._allOpen = on; $$('.step', panel).forEach(st => { st.classList.toggle('open', on); const tri = st.querySelector('.tri'); if(tri) tri.textContent = on ? '▾' : '▸'; }); openAll.textContent = on ? '全て閉じる' : '全て開く'; }}, '全て開く');
+  const h = el('h4', null, tr('stepsHead', {n: t.steps.length, tools, thinks}));
+  const openAll = el('button', {class:'icon small', onclick: () => { const on = !panel._allOpen; panel._allOpen = on; $$('.step', panel).forEach(st => { st.classList.toggle('open', on); const tri = st.querySelector('.tri'); if(tri) tri.textContent = on ? '▾' : '▸'; }); openAll.textContent = on ? tr('closeAll') : tr('openAll'); }}, tr('openAll'));
   h.append(openAll);
   panel.append(h);
   for(const s of t.steps){ const n = renderStep(s, 0); if(n) panel.append(n); }
   for(const a of (t.agents || [])){
-    const sub = el('div', {class:'subagent'}, el('div', {class:'lab'}, `サブエージェント ${a.type || ''}: ${a.description || a.id}`));
+    const sub = el('div', {class:'subagent'}, el('div', {class:'lab'}, tr('subagentLegacy', {type: a.type || '', desc: a.description || a.id})));
     for(const ss of a.steps){ const n = renderStep(ss, 1); if(n) sub.append(n); }
     panel.append(sub);
   }
@@ -2078,22 +2264,22 @@ function csvEscape(v){ v = String(v == null ? '' : v); return /[",\n\r]/.test(v)
 function stitle(sid){ const s = state.project.sessions.find(x => x.id === sid); return s ? (s.title || s.id.slice(0,8)) : sid; }
 async function exportCSV(mode){
   const turns = visibleTurns(); const rows = [];
-  if(mode === 'full'){ try{ await ensureDetails(turns); }catch(e){ alert('取得に失敗: ' + e.message); return; } }
+  if(mode === 'full'){ try{ await ensureDetails(turns); }catch(e){ alert(tr('fetchFailed') + e.message); return; } }
   if(mode === 'prompts'){
-    rows.push(['日時','セッション','種別','依頼']);
-    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), KIND_LABEL[t.kind] || t.kind, t.prompt || t.label || '']);
+    rows.push(tr('csvHeadPrompts'));
+    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), kindLabel(t.kind), t.prompt || turnLabel(t)]);
   } else if(mode === 'pairs'){
-    rows.push(['日時','セッション','種別','依頼','応答日時','応答','要約','所要時間(秒)','ツール回数']);
-    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), KIND_LABEL[t.kind] || t.kind, t.prompt || t.label || '', t.responses.length ? fmtDT(t.responses[t.responses.length-1].ts) : '', t.responses.map(r => r.text).join('\n\n'), t.recap || '', t.durationMs != null ? Math.round(t.durationMs/1000) : '', t.toolCount]);
+    rows.push(tr('csvHeadPairs'));
+    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), kindLabel(t.kind), t.prompt || turnLabel(t), t.responses.length ? fmtDT(t.responses[t.responses.length-1].ts) : '', t.responses.map(r => r.text).join('\n\n'), t.recap || '', t.durationMs != null ? Math.round(t.durationMs/1000) : '', t.toolCount]);
   } else {
-    rows.push(['日時','セッション','ターン番号','種類','名前','内容']);
+    rows.push(tr('csvHeadFull'));
     turns.forEach((t, i) => {
-      rows.push([fmtDT(t.ts), stitle(t.sid), i+1, '依頼(' + (KIND_LABEL[t.kind] || t.kind) + ')', '', t.prompt || t.label || '']);
+      rows.push([fmtDT(t.ts), stitle(t.sid), i+1, tr('csvPromptKind', {k: kindLabel(t.kind)}), '', t.prompt || turnLabel(t)]);
       for(const s of (t.steps || [])){
         if(s.kind === 'tool'){
-          rows.push([fmtDT(s.ts), stitle(t.sid), i+1, 'ツール呼び出し', s.name, typeof s.input === 'string' ? s.input : JSON.stringify(s.input)]);
-          if(s.result != null) rows.push([fmtDT(s.resultTs || s.ts), stitle(t.sid), i+1, 'ツール結果' + (s.isError ? '(エラー)' : ''), s.name, s.result]);
-        } else rows.push([fmtDT(s.ts), stitle(t.sid), i+1, STEP_LABEL[s.kind] || s.kind, s.name || '', s.text || '']);
+          rows.push([fmtDT(s.ts), stitle(t.sid), i+1, tr('csvToolCall'), s.name, typeof s.input === 'string' ? s.input : JSON.stringify(s.input)]);
+          if(s.result != null) rows.push([fmtDT(s.resultTs || s.ts), stitle(t.sid), i+1, s.isError ? tr('csvToolResultErr') : tr('csvToolResult'), s.name, s.result]);
+        } else rows.push([fmtDT(s.ts), stitle(t.sid), i+1, stepLabel(s.kind), s.name || '', s.text || '']);
       }
     });
   }
@@ -2101,14 +2287,14 @@ async function exportCSV(mode){
   download(`${state.project.name}-${mode}-${dayKey(new Date().toISOString())}.csv`, text, 'text/csv;charset=utf-8');
 }
 function exportMD(mode){
-  const turns = visibleTurns(); const out = [`# ${state.project.name} — ${mode === 'prompts' ? '依頼一覧' : '依頼と応答'}`, ''];
+  const turns = visibleTurns(); const out = [`# ${state.project.name} — ${mode === 'prompts' ? tr('mdPromptsTitle') : tr('mdPairsTitle')}`, ''];
   for(const t of turns){
-    out.push(`## ${fmtDT(t.ts)} [${KIND_LABEL[t.kind] || t.kind}] (${sessionLabel(t.sid)})`, '', t.prompt || t.label || '', '');
-    if(mode === 'pairs'){ if(t.recap) out.push(`> 要約: ${t.recap}`, ''); for(const r of t.responses) out.push(`### 応答 ${fmtDT(r.ts)}`, '', r.text, ''); }
+    out.push(`## ${fmtDT(t.ts)} [${kindLabel(t.kind)}] (${sessionLabel(t.sid)})`, '', t.prompt || turnLabel(t), '');
+    if(mode === 'pairs'){ if(t.recap) out.push(tr('mdRecap') + t.recap, ''); for(const r of t.responses) out.push(tr('mdResponse') + fmtDT(r.ts), '', r.text, ''); }
   }
   copyText(out.join('\n'));
 }
-function exportPlain(){ copyText(visibleTurns().map(t => (t.prompt || t.label || '').replace(/\s*\n\s*/g, ' ')).join('\n')); }
+function exportPlain(){ copyText(visibleTurns().map(t => (t.prompt || turnLabel(t)).replace(/\s*\n\s*/g, ' ')).join('\n')); }
 
 // ------------------------------------------------------------ events
 let searchSeq = 0;
@@ -2119,9 +2305,9 @@ async function applySearch(){
   state.allMatch = null;
   if(!state.project) return;
   if(state.scope === 'all' && state.terms.length && !EMBEDDED){
-    const seq = ++searchSeq; $('#matchCount').textContent = '検索中…';
+    const seq = ++searchSeq; $('#matchCount').textContent = tr('searching');
     try{ const ids = await apiSearch(state.pid, q, 'all'); if(seq !== searchSeq) return; state.allMatch = new Set(ids); }
-    catch(e){ $('#matchCount').textContent = '検索失敗: ' + e.message; return; }
+    catch(e){ $('#matchCount').textContent = tr('searchFailed') + e.message; return; }
     const vs = visibleTurns();
     try{ await ensureDetails(vs); }catch(e){}
     if(seq !== searchSeq) return;
@@ -2135,15 +2321,16 @@ for(const id of ['dateFrom','dateTo','pinOnly','humanOnly','showPeer','showSys']
 $('#projFilter').addEventListener('input', renderProjectList);
 $('#btnReloadList').addEventListener('click', loadProjects);
 $('#btnRootAdd').addEventListener('click', () => changeRoot('add', $('#rootInput').value.trim()));
-$('#btnMerge').addEventListener('click', () => { if(EMBEDDED){ toast('書き出し版では統合できません'); return; } state.mergeMode ? exitMerge() : enterMerge(); });
+$('#btnMerge').addEventListener('click', () => { if(EMBEDDED){ toast(tr('noMergeEmbedded')); return; } state.mergeMode ? exitMerge() : enterMerge(); });
 $('#btnMergeCancel').addEventListener('click', exitMerge);
-$('#btnMergeDo').addEventListener('click', () => { if(state.mergeSel.size < 2){ alert('2 つ以上選んでください'); return; } changeGroup({action:'create', name: $('#mergeName').value.trim(), members: [...state.mergeSel]}); });
+$('#btnLang').addEventListener('click', () => setLang(LANG === 'ja' ? 'en' : 'ja'));
+$('#btnMergeDo').addEventListener('click', () => { if(state.mergeSel.size < 2){ alert(tr('selectTwo')); return; } changeGroup({action:'create', name: $('#mergeName').value.trim(), members: [...state.mergeSel]}); });
 $('#rootInput').addEventListener('keydown', ev => { if(ev.key === 'Enter') changeRoot('add', $('#rootInput').value.trim()); });
 $('#btnRefresh').addEventListener('click', () => { if(state.pid) selectProject(state.pid, true); });
 $('#btnSide').addEventListener('click', () => $('#side').classList.toggle('hidden'));
 $('#btnHelp').addEventListener('click', ev => { ev.preventDefault(); $('#help').classList.toggle('show'); });
 $('#expandResp').addEventListener('click', () => { for(const t of visibleTurns()) (state.open[t.id] || (state.open[t.id] = {})).r = true; renderTimeline(); });
-$('#expandDetail').addEventListener('click', async () => { const vs = visibleTurns(); try{ await ensureDetails(vs); }catch(e){ alert('取得に失敗: ' + e.message); return; } for(const t of vs) { const o = state.open[t.id] || (state.open[t.id] = {}); o.r = true; o.d = true; } renderTimeline(); });
+$('#expandDetail').addEventListener('click', async () => { const vs = visibleTurns(); try{ await ensureDetails(vs); }catch(e){ alert(tr('fetchFailed') + e.message); return; } for(const t of vs) { const o = state.open[t.id] || (state.open[t.id] = {}); o.r = true; o.d = true; } renderTimeline(); });
 $('#collapseAll').addEventListener('click', () => { state.open = {}; renderTimeline(); });
 $('#exportDD > button').addEventListener('click', ev => { ev.stopPropagation(); $('#exportDD').classList.toggle('open'); });
 document.addEventListener('click', ev => { if(!ev.target.closest('#exportDD')) $('#exportDD').classList.remove('open'); });
@@ -2169,6 +2356,7 @@ document.addEventListener('keydown', ev => {
 
 // ------------------------------------------------------------ init
 (async function(){
+  applyI18n();
   await loadProjects();
   const m = location.hash.match(/p=([^&]+)/);
   if(m){ const pid = decodeURIComponent(m[1]); if(state.projects.some(p => p.id === pid)) selectProject(pid); }

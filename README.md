@@ -7,7 +7,9 @@
 > keyword search, CSV / Markdown export, copy buttons, pinning, merging logs from several
 > locations, and merging projects whose working path has changed. Run `python3 cldviewer.py`
 > and a browser opens. `python3 cldviewer.py export -o cld.html` produces a standalone HTML
-> that needs no Python. UI text is Japanese.
+> that needs no Python. The UI is bilingual: click the **EN / 日本語** button in the sidebar to
+> switch, or start with `python3 cldviewer.py --lang en` (also `CLDVIEWER_LANG=en`) to make
+> English the default for the UI, CSV headers and CLI messages.
 
 `~/.claude/projects/` に蓄積される Claude Code のセッションログ（JSONL）を、
 プロジェクト（作業フォルダ）単位で時系列に振り返るためのビューアです。
@@ -31,10 +33,17 @@
 python3 cldviewer.py                 # ~/.claude/projects を読み込み、ブラウザが開く（http://localhost:8765/）
 python3 cldviewer.py --port 9000     # ポートを変える（使用中なら自動で次のポートを探す）
 python3 cldviewer.py --no-browser    # ブラウザを自動で開かない
+python3 cldviewer.py --lang en       # 英語で起動（UI の初期言語・CSV の見出し・CLI のメッセージ）
 python3 cldviewer.py list            # プロジェクト一覧を端末に表示
 ```
 
 終了は Ctrl+C です。
+
+### 表示言語
+
+- 画面左上の **EN / 日本語** ボタンでいつでも切り替えられます。選んだ言語はブラウザに記憶されます。
+- `--lang en` または環境変数 `CLDVIEWER_LANG=en` で、UI の初期言語、CSV の見出し、CLI のメッセージとヘルプを英語にできます。
+- 書き出した単体 HTML でも同じボタンで切り替えられます。
 
 ### ログの場所を増やす（別ドライブ・別端末のログ）
 
@@ -163,7 +172,7 @@ python3 cldviewer.py csv --project keydisp --mode pairs -o out.csv
 
 | ファイル | 内容 |
 |---|---|
-| `cldviewer.py` | 本体（解析・サーバ・CLI・内蔵 UI） |
+| `cldviewer.py` | 本体（解析・サーバ・CLI・内蔵 UI、日本語/英語の文言辞書） |
 | `~/.cache/cldviewer/` | 解析キャッシュ（消しても再生成されます） |
 | `~/.config/cldviewer/roots.json` | 画面から追加したログの場所 |
 | `~/.config/cldviewer/groups.json` | プロジェクト統合の定義 |
