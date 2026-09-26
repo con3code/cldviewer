@@ -1648,6 +1648,10 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
             <option value="response" data-i18n="scopeResponse"></option>
             <option value="all" data-i18n="scopeAll"></option>
           </select>
+          <select id="order" data-i18n-title="orderTitle">
+            <option value="asc" data-i18n="orderAsc"></option>
+            <option value="desc" data-i18n="orderDesc"></option>
+          </select>
           <span id="matchCount" class="small muted"></span>
           <input type="date" id="dateFrom" data-i18n-title="dateFrom"> <span class="muted">〜</span> <input type="date" id="dateTo" data-i18n-title="dateTo">
           <label><input type="checkbox" id="pinOnly"> <span data-i18n="pinOnly"></span></label>
@@ -1695,6 +1699,7 @@ ja: {
   rootsTitle:'ログの場所', rootInput:'追加するディレクトリのパス', btnRootAdd:'追加', btnHelp:'キー操作', btnSide:'サイドバー切替',
   btnRefresh:'ログを更新', btnRefreshTitle:'このプロジェクトのログを再読み込み', empty:'左のリストからプロジェクトを選んでください',
   q:'キーワード検索（スペース区切りで AND）  [/]', scopePrompt:'範囲: 依頼', scopeResponse:'範囲: 応答', scopeAll:'範囲: 全体（推論・ツールログ含む）',
+  orderTitle:'並び順', orderAsc:'古い順', orderDesc:'新しい順',
   dateFrom:'開始日', dateTo:'終了日', pinOnly:'ピン留めのみ', humanOnly:'依頼のあるターンのみ', showPeer:'他エージェントからのメッセージ（畳んで表示）', showSys:'通知・システム行を表示',
   expandResp:'応答を全展開', expandDetail:'詳細を全展開', collapseAll:'全て閉じる', exportBtn:'書き出し / コピー ▾', exportNote:'※ 現在の絞り込み結果が対象',
   csvPrompts:'CSV: 依頼のみ', csvPairs:'CSV: 依頼と応答', csvFull:'CSV: 全体（推論・ツールログ含む）', mdPrompts:'Markdown をコピー: 依頼のみ', mdPairs:'Markdown をコピー: 依頼と応答', plainPrompts:'プレーンテキストをコピー: 依頼のみ（1 行 1 依頼）',
@@ -1732,6 +1737,7 @@ en: {
   rootsTitle:'Log locations', rootInput:'Directory path to add', btnRootAdd:'Add', btnHelp:'Keys', btnSide:'Toggle sidebar',
   btnRefresh:'Reload logs', btnRefreshTitle:'Re-read the logs of this project', empty:'Select a project from the list on the left',
   q:'Search keywords (space = AND)  [/]', scopePrompt:'Scope: prompts', scopeResponse:'Scope: responses', scopeAll:'Scope: everything (incl. reasoning & tool logs)',
+  orderTitle:'Sort order', orderAsc:'Oldest first', orderDesc:'Newest first',
   dateFrom:'From', dateTo:'To', pinOnly:'Pinned only', humanOnly:'Turns with a prompt only', showPeer:'Messages from other agents (folded)', showSys:'Show notification / system rows',
   expandResp:'Expand all responses', expandDetail:'Expand all details', collapseAll:'Collapse all', exportBtn:'Export / Copy ▾', exportNote:'Applies to the current filtered result',
   csvPrompts:'CSV: prompts only', csvPairs:'CSV: prompts and responses', csvFull:'CSV: everything (incl. reasoning & tool logs)', mdPrompts:'Copy Markdown: prompts only', mdPairs:'Copy Markdown: prompts and responses', plainPrompts:'Copy plain text: prompts only (one per line)',
@@ -2083,7 +2089,7 @@ function matches(t){
   const hay = turnText(t, state.scope).toLowerCase();
   return state.terms.every(k => hay.includes(k));
 }
-function visibleTurns(){
+function visibleTurnsAsc(){
   const p = state.project; if(!p) return [];
   const from = $('#dateFrom').value, to = $('#dateTo').value;
   const pinOnly = $('#pinOnly').checked, humanOnly = $('#humanOnly').checked, showPeer = $('#showPeer').checked;
@@ -2097,6 +2103,10 @@ function visibleTurns(){
     if(to && dk && dk > to) return false;
     return matches(t);
   });
+}
+function visibleTurns(){
+  const list = visibleTurnsAsc();
+  return $('#order').value === 'desc' ? list.slice().reverse() : list;
 }
 
 // ------------------------------------------------------------ timeline
@@ -2318,6 +2328,8 @@ let searchTimer;
 $('#q').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(applySearch, 250); });
 $('#scope').addEventListener('change', applySearch);
 for(const id of ['dateFrom','dateTo','pinOnly','humanOnly','showPeer','showSys']) $('#' + id).addEventListener('change', () => { if(state.project) renderTimeline(); });
+try{ const o = localStorage.getItem('cldviewer.order'); if(o === 'asc' || o === 'desc') $('#order').value = o; }catch(e){}
+$('#order').addEventListener('change', () => { try{ localStorage.setItem('cldviewer.order', $('#order').value); }catch(e){} if(state.project) renderTimeline(); });
 $('#projFilter').addEventListener('input', renderProjectList);
 $('#btnReloadList').addEventListener('click', loadProjects);
 $('#btnRootAdd').addEventListener('click', () => changeRoot('add', $('#rootInput').value.trim()));
