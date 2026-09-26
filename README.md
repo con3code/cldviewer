@@ -77,6 +77,7 @@ python3 cldviewer.py --dir ~/.claude/projects --dir /Volumes/HDD/claude-projects
 ```bash
 python3 cldviewer.py export -o cld.html --project keydisp   # 特定プロジェクトだけ（パスや名前の部分一致、複数可）
 python3 cldviewer.py export -o cld.html --light             # 全プロジェクト、推論・ツールログを省いて軽量に
+python3 cldviewer.py export -o cld.html --project keydisp --images   # 画像も埋め込む（サイズ大）
 ```
 
 書き出した HTML はブラウザで開くだけで、検索・展開・CSV 書き出しがそのまま使えます。
@@ -142,6 +143,8 @@ python3 cldviewer.py csv --project keydisp --mode pairs -o out.csv
   該当するパネル（応答や詳細）は自動で開きます
 - 日付範囲、セッション、ピン留めのみ、他エージェントメッセージの表示有無で絞り込めます
 - 並び順は「古い順」「新しい順」を選べます（選択はブラウザに記憶）。書き出しも表示中の順序に従います
+- 依頼に貼り付けた画像や、ツール結果に含まれる画像（スクリーンショットなど）はサムネイル表示され、
+  クリックで拡大できます（Esc で閉じる、新しいタブで開くリンク付き）。「画像を表示」で切り替え可能です
 - 絞り込み結果はそのまま CSV / Markdown 書き出しの対象になります
 
 ### キー操作
@@ -162,7 +165,8 @@ python3 cldviewer.py csv --project keydisp --mode pairs -o out.csv
   （`--no-cache` で無効化）。初回は大きなログの解析に数秒かかることがあります
 - 「ログを更新」ボタンで、表示中のプロジェクトのログを読み直せます（Claude Code が動作中でも可）
 - ツールの入出力は 1 件 20,000 文字で丸めています（`cldviewer.py` 冒頭の `MAX_TEXT`）。
-  画像は `[画像]` に置き換えます
+  テキスト上では画像を `[image]` に置き換え、画像データ自体はキャッシュに入れず、
+  サムネイル表示時にログファイルの該当行から直接読み出します（単体 HTML では `--images` を付けたときのみ埋め込み）
 - 大きなプロジェクトでも軽いように、推論・ツールログは展開時にサーバから取得します。
   「全体」範囲の検索はサーバ側で行います
 - ピン留めはブラウザの localStorage に保存されます（プロジェクトごと）

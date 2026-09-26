@@ -18,6 +18,7 @@ cldviewer — Claude Code session log viewer (single file, standard library only
   python3 cldviewer.py --lang en       # 英語表示（UI の初期言語・CSV・メッセージ）/ English
 """
 import argparse
+import base64
 import csv
 import glob
 import hashlib
@@ -47,6 +48,7 @@ MSG = {
         "h_export": "データ埋め込み済みの単体 HTML を書き出す",
         "h_project": "対象プロジェクト（パスや名前の部分一致、複数可）",
         "h_light": "ツールログ・推論を省いて軽量化",
+        "h_images": "画像（貼り付けたスクリーンショット等）も埋め込む（ファイルが大きくなる）",
         "h_csv": "CSV を書き出す",
         "h_list": "プロジェクト一覧",
         "no_dir": "注意: ログディレクトリが見つかりません（スキップ）: %s",
@@ -80,6 +82,7 @@ MSG = {
         "h_export": "write a standalone HTML with the data embedded",
         "h_project": "target projects (substring of path or name; repeatable)",
         "h_light": "omit tool logs and reasoning to keep the file small",
+        "h_images": "embed images (pasted screenshots etc.); makes the file much larger",
         "h_csv": "write a CSV file",
         "h_list": "list projects",
         "no_dir": "note: log directory not found (skipped): %s",
@@ -112,7 +115,7 @@ DEFAULT_DIR = os.path.expanduser("~/.claude/projects")
 CACHE_DIR = os.path.expanduser("~/.cache/cldviewer")
 CONFIG_FILE = os.path.expanduser("~/.config/cldviewer/roots.json")  # UI から追加したログの場所
 GROUPS_FILE = os.path.expanduser("~/.config/cldviewer/groups.json")  # プロジェクト統合の定義
-CACHE_VERSION = 9
+CACHE_VERSION = 10
 MAX_TEXT = 20000        # ツール入出力 1 件あたりの保持上限（文字）
 MAX_SUB_TEXT = 4000     # サブエージェントの各ステップの保持上限
 
@@ -161,14 +164,15 @@ def tag_content(text, tag):
     return m.group(1).strip() if m else ""
 
 
-def content_to_text(content):
-    """message.content（str または block list）から表示用テキストと画像数を返す。"""
+def content_to_text(content, refs=None, prefix=""):
+    """message.content（str または block list）から表示用テキストと画像数を返す。
+    refs を渡すと画像ブロックの位置（行内インデックス）を追加する。"""
     if content is None:
         return "", 0
     if isinstance(content, str):
         return content, 0
     parts, images = [], 0
-    for b in content:
+    for j, b in enumerate(content):
         if not isinstance(b, dict):
             parts.append(str(b))
             continue
@@ -178,9 +182,32 @@ def content_to_text(content):
         elif bt == "image":
             images += 1
             parts.append("[image]")
+            if refs is not None:
+                src = b.get("source") or {}
+                ref = {"idx": prefix + str(j), "type": src.get("media_type") or "image/png"}
+                if src.get("type") == "url" and src.get("url"):
+                    ref["url"] = src["url"]
+                refs.append(ref)
         elif bt == "document":
             parts.append("[document]")
     return "\n".join(p for p in parts if p), images
+
+
+def image_from_line(path, off, idx):
+    """ログファイルの指定オフセットの行から画像ブロックを取り出す。(media_type, bytes) を返す。"""
+    with open(path, "rb") as f:
+        f.seek(int(off))
+        raw = f.readline()
+    o = json.loads(raw.decode("utf-8", errors="replace"))
+    content = (o.get("message") or {}).get("content")
+    parts = str(idx).split(".")
+    b = content[int(parts[0])]
+    if len(parts) > 1:
+        b = b["content"][int(parts[1])]
+    src = b.get("source") or {}
+    if src.get("type") != "base64":
+        raise ValueError("not a base64 image")
+    return src.get("media_type") or "image/png", base64.b64decode(src.get("data") or "")
 
 
 def iso_to_ms(ts):
@@ -361,18 +388,29 @@ class SessionParser:
             self.feed_sidechain(o, ts, "user")
             return
         # ツール結果
-        remaining = []
+        refs = []
         if isinstance(c, list):
-            for b in c:
+            remaining = []
+            for j, b in enumerate(c):
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    self.attach_tool_result(b, ts)
+                    self.attach_tool_result(b, ts, j)
                 else:
-                    remaining.append(b)
+                    remaining.append((j, b))
             if not remaining:
                 return
-            text, images = content_to_text(remaining)
+            parts, images = [], 0
+            for j, b in remaining:
+                t2, n = content_to_text([b], refs, "")
+                if refs and refs[-1]["idx"] == "0" and n:
+                    refs[-1]["idx"] = str(j)
+                images += n
+                if t2:
+                    parts.append(t2)
+            text = "\n".join(parts)
         else:
             text, images = content_to_text(c)
+        for r in refs:
+            r["off"] = self.cur_off
         raw = text
         text = text.strip()
         if not text:
@@ -430,7 +468,7 @@ class SessionParser:
         if not cleaned:
             return
         kind = "queued" if src == "queued" else "typed"
-        self.new_turn(ts, kind, cleaned, images=images, promptId=o.get("promptId"))
+        self.new_turn(ts, kind, cleaned, images=images, imageRefs=refs, promptId=o.get("promptId"))
 
     def peer_message(self, ts, origin, text, prompt_id):
         """他エージェントからのメッセージ。自セッションのサブエージェントの最終報告（hand-back）は通知扱い。"""
@@ -441,20 +479,27 @@ class SessionParser:
             return
         self.new_turn(ts, "peer", body, sender=sender, promptId=prompt_id)
 
-    def attach_tool_result(self, b, ts):
+    def attach_tool_result(self, b, ts, j=0):
         tid = b.get("tool_use_id")
         content = b.get("content")
+        refs = []
         if isinstance(content, list):
-            text, _ = content_to_text(content)
+            text, _ = content_to_text(content, refs, "%d." % j)
+            for r in refs:
+                r["off"] = self.cur_off
         else:
             text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
         step = self.tool_index.get(tid)
         if step is None:
-            self.add_step(ts, "tool", id=tid, name="?", input={}, result=trim(text), isError=bool(b.get("is_error")), resultTs=ts)
+            step = self.add_step(ts, "tool", id=tid, name="?", input={}, result=trim(text), isError=bool(b.get("is_error")), resultTs=ts)
+            if refs:
+                step["images"] = refs
             return
         step["result"] = trim(text)
         step["isError"] = bool(b.get("is_error"))
         step["resultTs"] = ts
+        if refs:
+            step["images"] = refs
         if ts and self.cur is not None:
             self.cur["endTs"] = ts
 
@@ -503,10 +548,16 @@ class SessionParser:
 
     # --- 実行 ---------------------------------------------------------------
     def run(self):
-        with open(self.path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+        self.cur_off = 0
+        with open(self.path, "rb") as f:
+            while True:
+                off = f.tell()
+                raw = f.readline()
+                if not raw:
+                    break
                 self.sess["lines"] += 1
-                line = line.strip()
+                self.cur_off = off
+                line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 try:
@@ -1250,6 +1301,19 @@ def make_handler(store):
                         if want is None or t["id"] in want:
                             out[t["id"]] = turn_details(p, t)
                     self.send_json(out)
+                elif path.startswith("/api/image/"):
+                    rest = path[len("/api/image/"):]
+                    pid, _, sid = rest.partition("/")
+                    fp = next((f for f in project_files(store.roots, pid, store.groups) if os.path.basename(f) == sid + ".jsonl"), None)
+                    if not fp:
+                        raise FileNotFoundError(sid)
+                    mt, data = image_from_line(fp, q.get("off", ["0"])[0], q.get("idx", ["0"])[0])
+                    self.send_response(200)
+                    self.send_header("Content-Type", mt)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "max-age=3600")
+                    self.end_headers()
+                    self.wfile.write(data)
                 elif path.startswith("/api/search/"):
                     pid = path[len("/api/search/"):]
                     p = store.get_project(pid)
@@ -1339,6 +1403,24 @@ def cmd_export(args):
             d = turn_details(full, t)
             lt["steps"] = d["steps"]
             lt["agents"] = d["agents"]
+        if args.images:
+            files = {os.path.basename(f)[:-6]: f for f in project_files(root, p["id"], groups)}
+            n_img = 0
+            for lt in emb["turns"]:
+                refs = list(lt.get("imageRefs") or [])
+                for s in lt.get("steps") or []:
+                    refs.extend(s.get("images") or [])
+                for r in refs:
+                    fp = files.get(lt["sid"])
+                    if not fp or "off" not in r:
+                        continue
+                    try:
+                        mt, b = image_from_line(fp, r["off"], r["idx"])
+                        r["dataUrl"] = "data:%s;base64,%s" % (mt, base64.b64encode(b).decode("ascii"))
+                        n_img += 1
+                    except Exception:
+                        pass
+            sys.stderr.write("  images embedded: %d\n" % n_img)
         data[p["id"]] = emb
     payload = json.dumps({"roots": [{"path": r, "ok": True, "saved": False} for r in root], "projects": projects, "data": data}, ensure_ascii=False)
     payload = payload.replace("</", "<\\/")
@@ -1407,6 +1489,7 @@ def main(argv=None):
     ep.add_argument("-o", "--out", default="cldviewer-export.html")
     ep.add_argument("--project", nargs="*", default=[], help=_("h_project"))
     ep.add_argument("--light", action="store_true", help=_("h_light"))
+    ep.add_argument("--images", action="store_true", help=_("h_images"))
 
     cp = sub.add_parser("csv", help=_("h_csv"), parents=[common])
     cp.add_argument("--project", nargs="*", default=[], help=_("h_project"))
@@ -1596,6 +1679,17 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
 .kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-radius:4px;padding:0 4px;background:var(--bg)}
 #help{position:fixed;right:16px;bottom:16px;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:10px 14px;font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.2);display:none;z-index:30}
 #help.show{display:block}
+.thumbs{display:flex;flex-wrap:wrap;gap:6px;padding:4px 12px 6px}
+.sbody .thumbs{padding:6px 0 0}
+.thumbs img{max-height:120px;max-width:220px;border:1px solid var(--line2);border-radius:6px;cursor:zoom-in;background:var(--panel);object-fit:contain}
+.thumbs img:hover{border-color:var(--accent)}
+.thumbs .noimg{font-size:11px;color:var(--muted);border:1px dashed var(--line2);border-radius:6px;padding:4px 8px}
+#lightbox{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;flex-direction:column;z-index:70;cursor:zoom-out}
+#lightbox.show{display:flex}
+#lightbox .lbbar{display:flex;gap:12px;align-items:center;padding:8px 14px;color:#eee;font-size:12px;cursor:default}
+#lightbox .lbbar a{color:#9cc4ff}
+#lightbox .lbbar .icon{color:#eee;margin-left:auto;font-size:16px}
+#lightbox img{flex:1;min-height:0;object-fit:contain;max-width:100%;padding:0 14px 14px}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:6px 14px;border-radius:20px;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:60}
 #toast.show{opacity:1}
 @media (max-width:900px){#side{position:absolute;z-index:10;height:100%;box-shadow:0 0 30px rgba(0,0,0,.3)} #timeline{padding:8px 10px 80px} .proj-head{padding:10px 10px 6px} .toolbar{padding:8px 10px}}
@@ -1658,6 +1752,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
           <label><input type="checkbox" id="humanOnly" checked> <span data-i18n="humanOnly"></span></label>
           <label><input type="checkbox" id="showPeer" checked> <span data-i18n="showPeer"></span></label>
           <label><input type="checkbox" id="showSys"> <span data-i18n="showSys"></span></label>
+          <label><input type="checkbox" id="showImg" checked> <span data-i18n="showImg"></span></label>
           <span style="flex-basis:100%;height:0"></span>
           <button id="expandResp" class="small" data-i18n="expandResp"></button>
           <button id="expandDetail" class="small" data-i18n="expandDetail"></button>
@@ -1684,6 +1779,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
   </main>
 </div>
 <div id="loading"><div class="box" id="loadingMsg"></div></div>
+<div id="lightbox"><div class="lbbar"><span id="lbCaption"></span><a id="lbOpen" target="_blank" rel="noopener"></a><button class="icon" id="lbClose">✕</button></div><img id="lbImg" alt=""></div>
 <div id="help"></div>
 <div id="toast"></div>
 <script>
@@ -1700,6 +1796,7 @@ ja: {
   btnRefresh:'ログを更新', btnRefreshTitle:'このプロジェクトのログを再読み込み', empty:'左のリストからプロジェクトを選んでください',
   q:'キーワード検索（スペース区切りで AND）  [/]', scopePrompt:'範囲: 依頼', scopeResponse:'範囲: 応答', scopeAll:'範囲: 全体（推論・ツールログ含む）',
   orderTitle:'並び順', orderAsc:'古い順', orderDesc:'新しい順',
+  showImg:'画像を表示', openImage:'新しいタブで開く', imageN:'画像 {n}', noImageData:'画像は書き出し版に含まれていません（export --images で埋め込み可）',
   dateFrom:'開始日', dateTo:'終了日', pinOnly:'ピン留めのみ', humanOnly:'依頼のあるターンのみ', showPeer:'他エージェントからのメッセージ（畳んで表示）', showSys:'通知・システム行を表示',
   expandResp:'応答を全展開', expandDetail:'詳細を全展開', collapseAll:'全て閉じる', exportBtn:'書き出し / コピー ▾', exportNote:'※ 現在の絞り込み結果が対象',
   csvPrompts:'CSV: 依頼のみ', csvPairs:'CSV: 依頼と応答', csvFull:'CSV: 全体（推論・ツールログ含む）', mdPrompts:'Markdown をコピー: 依頼のみ', mdPairs:'Markdown をコピー: 依頼と応答', plainPrompts:'プレーンテキストをコピー: 依頼のみ（1 行 1 依頼）',
@@ -1738,6 +1835,7 @@ en: {
   btnRefresh:'Reload logs', btnRefreshTitle:'Re-read the logs of this project', empty:'Select a project from the list on the left',
   q:'Search keywords (space = AND)  [/]', scopePrompt:'Scope: prompts', scopeResponse:'Scope: responses', scopeAll:'Scope: everything (incl. reasoning & tool logs)',
   orderTitle:'Sort order', orderAsc:'Oldest first', orderDesc:'Newest first',
+  showImg:'Show images', openImage:'Open in new tab', imageN:'Image {n}', noImageData:'Images are not included in this export (use export --images)',
   dateFrom:'From', dateTo:'To', pinOnly:'Pinned only', humanOnly:'Turns with a prompt only', showPeer:'Messages from other agents (folded)', showSys:'Show notification / system rows',
   expandResp:'Expand all responses', expandDetail:'Expand all details', collapseAll:'Collapse all', exportBtn:'Export / Copy ▾', exportNote:'Applies to the current filtered result',
   csvPrompts:'CSV: prompts only', csvPairs:'CSV: prompts and responses', csvFull:'CSV: everything (incl. reasoning & tool logs)', mdPrompts:'Copy Markdown: prompts only', mdPairs:'Copy Markdown: prompts and responses', plainPrompts:'Copy plain text: prompts only (one per line)',
@@ -1841,6 +1939,31 @@ function hlNode(root){
     frag.append(v.slice(last)); tn.replaceWith(frag);
   }
 }
+
+// ------------------------------------------------------------ images
+function imgSrc(sid, ref){
+  if(ref.dataUrl) return ref.dataUrl;
+  if(ref.url) return ref.url;
+  if(EMBEDDED || ref.off == null) return null;
+  return '/api/image/' + encodeURIComponent(state.pid) + '/' + encodeURIComponent(sid) + '?off=' + ref.off + '&idx=' + encodeURIComponent(ref.idx);
+}
+function renderImages(sid, refs){
+  if(!refs || !refs.length || !$('#showImg').checked) return null;
+  const box = el('div', {class:'thumbs'});
+  refs.forEach((ref, i) => {
+    const src = imgSrc(sid, ref);
+    if(!src){ box.append(el('span', {class:'noimg', title: tr('noImageData')}, tr('imageN', {n: i + 1}))); return; }
+    const img = el('img', {src, loading:'lazy', alt: tr('imageN', {n: i + 1}), title: tr('imageN', {n: i + 1}) + ' (' + (ref.type || '') + ')'});
+    img.addEventListener('click', ev => { ev.stopPropagation(); openLightbox(src, tr('imageN', {n: i + 1}) + ' · ' + (ref.type || '')); });
+    box.append(img);
+  });
+  return box;
+}
+function openLightbox(src, caption){
+  $('#lbImg').src = src; $('#lbCaption').textContent = caption || ''; $('#lbOpen').href = src; $('#lbOpen').textContent = tr('openImage');
+  $('#lightbox').classList.add('show');
+}
+function closeLightbox(){ $('#lightbox').classList.remove('show'); $('#lbImg').src = ''; }
 
 // ------------------------------------------------------------ markdown (minimal)
 function inline(s){
@@ -2163,6 +2286,7 @@ function renderTurn(t){
   const long = ptext.length > 500 || (ptext.match(/\n/g) || []).length > 7;
   if(long && !state.terms.length){ prompt.classList.add('clamp'); const mb = el('button', {class:'morebtn small', onclick: () => { const c = prompt.classList.toggle('clamp'); mb.textContent = c ? tr('showFull') : tr('collapse'); }}, tr('showFull')); card.append(prompt, mb); }
   else card.append(prompt);
+  const thumbs = renderImages(t.sid, t.imageRefs); if(thumbs) card.append(thumbs);
   if(t.recap) card.append(el('div', {class:'recap', html: '<b>' + tr('recap') + '</b>' + hl(t.recap)}));
 
   const nResp = t.responses.length, nSteps = t.stepCount != null ? t.stepCount : (t.steps || []).length;
@@ -2213,7 +2337,7 @@ function toolSummary(s){
   const k = Object.keys(inp); if(!k.length) return '';
   const v = inp[k[0]]; return k[0] + ': ' + (typeof v === 'string' ? v.split('\n')[0] : JSON.stringify(v));
 }
-function renderStep(s, depth){
+function renderStep(s, depth, sid){
   const showSys = $('#showSys').checked;
   if(!showSys && (s.kind === 'notification' || s.kind === 'system' || s.kind === 'meta')) return null;
   if(s.kind === 'compact_boundary') return el('div', {class:'step s-compact_boundary'}, '— ' + s.text + ' —');
@@ -2234,11 +2358,12 @@ function renderStep(s, depth){
     if(s.result != null){
       body.append(el('div', {class:'lab'}, s.isError ? tr('resultError') : tr('result'), el('span', {class:'sp'}), s.resultTs ? el('span', null, fmtT(s.resultTs)) : null, copyBtn(() => s.result, tr('copyResult'))));
       body.append(el('pre', {html: hl(s.result || tr('emptyResult'))}));
+      const th = renderImages(sid, s.images); if(th) body.append(th);
     } else body.append(el('div', {class:'lab'}, tr('noResult')));
     if(s.subagent){
       const a = s.subagent;
       const sub = el('div', {class:'subagent'}, el('div', {class:'lab'}, tr('subagentHead', {type: a.type || '', model: a.model ? '(' + a.model + ')' : '', desc: a.description || '', from: fmtDT(a.firstTs), to: fmtT(a.lastTs)})));
-      for(const ss of a.steps){ const n = renderStep(ss, (depth || 0) + 1); if(n) sub.append(n); }
+      for(const ss of a.steps){ const n = renderStep(ss, (depth || 0) + 1, sid); if(n) sub.append(n); }
       body.append(sub);
     }
   } else {
@@ -2261,10 +2386,10 @@ function fillDetails(t, panel){
   const openAll = el('button', {class:'icon small', onclick: () => { const on = !panel._allOpen; panel._allOpen = on; $$('.step', panel).forEach(st => { st.classList.toggle('open', on); const tri = st.querySelector('.tri'); if(tri) tri.textContent = on ? '▾' : '▸'; }); openAll.textContent = on ? tr('closeAll') : tr('openAll'); }}, tr('openAll'));
   h.append(openAll);
   panel.append(h);
-  for(const s of t.steps){ const n = renderStep(s, 0); if(n) panel.append(n); }
+  for(const s of t.steps){ const n = renderStep(s, 0, t.sid); if(n) panel.append(n); }
   for(const a of (t.agents || [])){
     const sub = el('div', {class:'subagent'}, el('div', {class:'lab'}, tr('subagentLegacy', {type: a.type || '', desc: a.description || a.id})));
-    for(const ss of a.steps){ const n = renderStep(ss, 1); if(n) sub.append(n); }
+    for(const ss of a.steps){ const n = renderStep(ss, 1, t.sid); if(n) sub.append(n); }
     panel.append(sub);
   }
 }
@@ -2328,6 +2453,10 @@ let searchTimer;
 $('#q').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(applySearch, 250); });
 $('#scope').addEventListener('change', applySearch);
 for(const id of ['dateFrom','dateTo','pinOnly','humanOnly','showPeer','showSys']) $('#' + id).addEventListener('change', () => { if(state.project) renderTimeline(); });
+try{ const v = localStorage.getItem('cldviewer.showImg'); if(v === '0') $('#showImg').checked = false; }catch(e){}
+$('#showImg').addEventListener('change', () => { try{ localStorage.setItem('cldviewer.showImg', $('#showImg').checked ? '1' : '0'); }catch(e){} if(state.project) renderTimeline(); });
+$('#lightbox').addEventListener('click', ev => { if(!ev.target.closest('a')) closeLightbox(); });
+$('#lbClose').addEventListener('click', closeLightbox);
 try{ const o = localStorage.getItem('cldviewer.order'); if(o === 'asc' || o === 'desc') $('#order').value = o; }catch(e){}
 $('#order').addEventListener('change', () => { try{ localStorage.setItem('cldviewer.order', $('#order').value); }catch(e){} if(state.project) renderTimeline(); });
 $('#projFilter').addEventListener('input', renderProjectList);
@@ -2363,7 +2492,7 @@ document.addEventListener('keydown', ev => {
   else if(ev.key === 'p' && cur){ togglePin(turnOf(cur), cur); }
   else if(ev.key === 'c' && cur){ copyText(turnOf(cur).prompt); }
   else if(ev.key === '?'){ $('#help').classList.toggle('show'); }
-  else if(ev.key === 'Escape'){ $('#help').classList.remove('show'); }
+  else if(ev.key === 'Escape'){ $('#help').classList.remove('show'); closeLightbox(); }
 });
 
 // ------------------------------------------------------------ init
