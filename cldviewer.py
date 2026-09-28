@@ -40,7 +40,7 @@ LANG = "ja"  # CLI メッセージ・CSV 見出し・UI 初期言語（--lang / 
 MSG = {
     "ja": {
         "desc": "Claude Code セッションログビューア",
-        "h_dir": "ログディレクトリ（複数指定可。既定: ~/.claude/projects）",
+        "h_dir": "ログディレクトリ（複数指定可。既定: ~/.claude/projects と、あれば ~/.codex/sessions）",
         "h_nocache": "解析キャッシュ（~/.cache/cldviewer）を使わない",
         "h_noconfig": "保存済みの設定（追加したログの場所・プロジェクト統合）を読み込まない",
         "h_lang": "表示言語 ja / en（UI の初期言語・CSV 見出し・メッセージ。環境変数 CLDVIEWER_LANG でも指定可）",
@@ -70,11 +70,11 @@ MSG = {
         "csv_prompts": ["日時", "セッション", "種別", "依頼"],
         "csv_pairs": ["日時", "セッション", "種別", "依頼", "応答日時", "応答", "要約", "所要時間(秒)", "ツール回数"],
         "csv_full": ["日時", "セッション", "ターン番号", "種類", "名前", "内容"],
-        "csv_prompt_kind": "依頼(%s)", "csv_tool_call": "ツール呼び出し", "csv_tool_result": "ツール結果", "csv_tool_result_err": "ツール結果(エラー)",
+        "csv_agent": "エージェント", "csv_prompt_kind": "依頼(%s)", "csv_tool_call": "ツール呼び出し", "csv_tool_result": "ツール結果", "csv_tool_result_err": "ツール結果(エラー)",
     },
     "en": {
         "desc": "Claude Code session log viewer",
-        "h_dir": "log directory (repeatable; default: ~/.claude/projects)",
+        "h_dir": "log directory (repeatable; default: ~/.claude/projects plus ~/.codex/sessions if present)",
         "h_nocache": "do not use the parse cache (~/.cache/cldviewer)",
         "h_noconfig": "ignore saved settings (added log locations, merged projects)",
         "h_lang": "language ja / en (initial UI language, CSV headers, messages; also CLDVIEWER_LANG)",
@@ -104,7 +104,7 @@ MSG = {
         "csv_prompts": ["Time", "Session", "Kind", "Prompt"],
         "csv_pairs": ["Time", "Session", "Kind", "Prompt", "Response time", "Response", "Recap", "Duration (s)", "Tool calls"],
         "csv_full": ["Time", "Session", "Turn", "Type", "Name", "Content"],
-        "csv_prompt_kind": "Prompt (%s)", "csv_tool_call": "Tool call", "csv_tool_result": "Tool result", "csv_tool_result_err": "Tool result (error)",
+        "csv_agent": "Agent", "csv_prompt_kind": "Prompt (%s)", "csv_tool_call": "Tool call", "csv_tool_result": "Tool result", "csv_tool_result_err": "Tool result (error)",
     },
 }
 
@@ -112,10 +112,11 @@ MSG = {
 def _(key):
     return MSG.get(LANG, MSG["ja"]).get(key, MSG["ja"].get(key, key))
 DEFAULT_DIR = os.path.expanduser("~/.claude/projects")
+CODEX_DIR = os.path.expanduser("~/.codex/sessions")   # 存在すれば既定で読み込む
 CACHE_DIR = os.path.expanduser("~/.cache/cldviewer")
 CONFIG_FILE = os.path.expanduser("~/.config/cldviewer/roots.json")  # UI から追加したログの場所
 GROUPS_FILE = os.path.expanduser("~/.config/cldviewer/groups.json")  # プロジェクト統合の定義
-CACHE_VERSION = 10
+CACHE_VERSION = 11
 MAX_TEXT = 20000        # ツール入出力 1 件あたりの保持上限（文字）
 MAX_SUB_TEXT = 4000     # サブエージェントの各ステップの保持上限
 
@@ -199,15 +200,24 @@ def image_from_line(path, off, idx):
         f.seek(int(off))
         raw = f.readline()
     o = json.loads(raw.decode("utf-8", errors="replace"))
-    content = (o.get("message") or {}).get("content")
+    if "payload" in o and "message" not in o:      # Codex
+        content = (o.get("payload") or {}).get("content")
+    else:
+        content = (o.get("message") or {}).get("content")
     parts = str(idx).split(".")
     b = content[int(parts[0])]
     if len(parts) > 1:
         b = b["content"][int(parts[1])]
     src = b.get("source") or {}
-    if src.get("type") != "base64":
-        raise ValueError("not a base64 image")
-    return src.get("media_type") or "image/png", base64.b64decode(src.get("data") or "")
+    if src.get("type") == "base64":
+        return src.get("media_type") or "image/png", base64.b64decode(src.get("data") or "")
+    url = b.get("image_url") or ""
+    if isinstance(url, dict):
+        url = url.get("url") or ""
+    m = re.match(r"data:([^;]+);base64,(.*)$", url, re.S)
+    if m:
+        return m.group(1), base64.b64decode(m.group(2))
+    raise ValueError("not an embedded image")
 
 
 def iso_to_ms(ts):
@@ -248,6 +258,7 @@ class SessionParser:
             "models": {},
             "compactions": 0,
             "lines": 0,
+            "agent": "claude",
         }
 
     # --- ターン管理 -------------------------------------------------------
@@ -258,6 +269,7 @@ class SessionParser:
             "ts": ts,
             "endTs": ts,
             "kind": kind,            # typed / queued / command / shell / continuation / auto
+            "agent": "claude",
             "prompt": prompt or "",
             "images": 0,
             "recap": None,
@@ -638,6 +650,229 @@ class SessionParser:
                     target["sidechains"].append(aid)
 
 
+# ---------------------------------------------------------------------------
+# Codex（~/.codex/sessions/**/rollout-*.jsonl）
+# ---------------------------------------------------------------------------
+
+RE_CODEX_TAG = re.compile(r"^\s*<(environment_context|turn_aborted|recommended_plugins|user_instructions|permissions instructions|app_context|skills|collaboration_mode)[\s>]", re.I)
+# Codex がユーザーメッセージとして注入する文脈情報（依頼ではない）
+RE_CODEX_INJECTED = re.compile(r"^\s*(The following is the Codex agent history|# AGENTS\.md instructions|<INSTRUCTIONS>)", re.I)
+# 添付ファイルやタブ情報の前置きの後に「## My request:」として依頼が続く形式
+RE_CODEX_CONTEXT = re.compile(r"^\s*(# Chrome tabs:|# Files (?:mentioned|pasted) by the user:)", re.I)
+RE_CODEX_REQUEST = re.compile(r"^## My request[^\n]*\n", re.M)
+
+
+def codex_blocks_text(content, refs=None):
+    parts, images = [], 0
+    for j, b in enumerate(content or []):
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt in ("input_text", "output_text", "text"):
+            parts.append(b.get("text") or "")
+        elif bt in ("input_image", "image"):
+            images += 1
+            parts.append("[image]")
+            if refs is not None:
+                url = b.get("image_url") or ""
+                if isinstance(url, dict):
+                    url = url.get("url") or ""
+                ref = {"idx": str(j), "type": "image/png"}
+                m = re.match(r"data:([^;]+);", url or "")
+                if m:
+                    ref["type"] = m.group(1)
+                elif url:
+                    ref["url"] = url
+                refs.append(ref)
+        elif bt in ("input_file", "file"):
+            parts.append("[file: %s]" % (b.get("filename") or b.get("name") or ""))
+    return "\n".join(p for p in parts if p), images
+
+
+class CodexSessionParser(SessionParser):
+    """Codex のロールアウトログを Claude Code と同じターン構造に変換する。"""
+
+    def __init__(self, path):
+        SessionParser.__init__(self, path)
+        self.sess["agent"] = "codex"
+        self.pending_calls = {}
+
+    def new_turn(self, ts, kind, prompt, **extra):
+        t = SessionParser.new_turn(self, ts, kind, prompt, **extra)
+        t["agent"] = "codex"
+        if self.last_model and not t["model"]:
+            t["model"] = self.last_model
+        return t
+
+    last_model = None
+
+    def feed(self, o):
+        t = o.get("type")
+        ts = o.get("timestamp")
+        p = o.get("payload") if isinstance(o.get("payload"), dict) else {}
+        s = self.sess
+        if ts:
+            if s["firstTs"] is None or ts < s["firstTs"]:
+                s["firstTs"] = ts
+            if s["lastTs"] is None or ts > s["lastTs"]:
+                s["lastTs"] = ts
+        if t == "session_meta":
+            s["cwd"] = p.get("cwd") or s["cwd"]
+            s["version"] = p.get("cli_version")
+            s["originator"] = p.get("originator") or p.get("source")
+            g = p.get("git") or {}
+            if isinstance(g, dict) and g.get("branch"):
+                s["gitBranch"] = g["branch"]
+            if not s["firstTs"] and p.get("timestamp"):
+                s["firstTs"] = p["timestamp"]
+        elif t == "turn_context":
+            if p.get("model"):
+                self.last_model = p["model"]
+                if self.cur is not None and not self.cur["model"]:
+                    self.cur["model"] = p["model"]
+            if p.get("cwd") and not s["cwd"]:
+                s["cwd"] = p["cwd"]
+        elif t == "response_item":
+            self.feed_item(p, ts)
+        elif t == "event_msg":
+            self.feed_event(p, ts)
+        elif t == "compacted":
+            s["compactions"] += 1
+            self.add_step(ts, "compact_boundary", text="context compacted")
+            msg = p.get("message")
+            if msg:
+                self.add_step(ts, "compact", text=trim(msg))
+
+    def feed_item(self, p, ts):
+        pt = p.get("type")
+        if pt == "message":
+            role = p.get("role")
+            if role == "user":
+                refs = []
+                text, images = codex_blocks_text(p.get("content"), refs)
+                if not text.strip() and not images:
+                    return
+                if RE_CODEX_TAG.match(text) or RE_CODEX_INJECTED.match(text):
+                    if self.cur is not None:
+                        self.add_step(ts, "meta", name="codex-context", text=trim(text, 4000))
+                    return
+                preamble = None
+                if RE_CODEX_CONTEXT.match(text):
+                    m = RE_CODEX_REQUEST.search(text)
+                    if not m:
+                        if self.cur is not None:
+                            self.add_step(ts, "meta", name="codex-context", text=trim(text, 4000))
+                        return
+                    preamble, text = text[:m.start()], text[m.end():]
+                for r in refs:
+                    r["off"] = self.cur_off
+                self.new_turn(ts, "typed", text.strip(), images=images, imageRefs=refs)
+                if preamble and preamble.strip():
+                    self.add_step(ts, "meta", name="codex-context", text=trim(preamble.strip(), 4000))
+            elif role == "assistant":
+                text, _ = codex_blocks_text(p.get("content"))
+                if text.strip():
+                    t = self.ensure_turn(ts)
+                    self.add_step(ts, "text", text=text, phase=p.get("phase"))
+                    t["responses"].append({"ts": ts, "text": text})
+            # developer ロールは指示文なので表示しない
+        elif pt == "reasoning":
+            parts = [x.get("text") or "" for x in (p.get("summary") or []) if isinstance(x, dict)]
+            if p.get("content"):
+                parts += [x.get("text") or "" for x in p["content"] if isinstance(x, dict)]
+            text = "\n".join(x for x in parts if x)
+            if text.strip():
+                self.add_step(ts, "thinking", text=trim(text))
+        elif pt in ("function_call", "custom_tool_call"):
+            name = p.get("name") or pt
+            raw_in = p.get("arguments") if pt == "function_call" else p.get("input")
+            inp = raw_in
+            if isinstance(raw_in, str):
+                try:
+                    inp = json.loads(raw_in)
+                except Exception:
+                    inp = raw_in
+            if name == "apply_patch" and isinstance(inp, str):
+                files = re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", inp, re.M)
+                inp = {"files": files, "patch": inp}
+            if isinstance(inp, dict) and "cmd" in inp and "command" not in inp:
+                inp = dict(inp)
+                inp["command"] = inp.pop("cmd")
+            t = self.ensure_turn(ts)
+            step = self.add_step(ts, "tool", id=p.get("call_id"), name=name, input=trim_obj(inp), result=None, isError=False)
+            self.tool_index[p.get("call_id")] = step
+            t["toolCount"] += 1
+        elif pt in ("function_call_output", "custom_tool_call_output"):
+            out = p.get("output")
+            if isinstance(out, dict):
+                out = out.get("output") or json.dumps(out, ensure_ascii=False)
+            if isinstance(out, str):
+                try:
+                    j = json.loads(out)
+                    if isinstance(j, dict) and "output" in j:
+                        meta = j.get("metadata") or {}
+                        out = j["output"]
+                        if meta.get("exit_code") not in (None, 0):
+                            out = "[exit code %s]\n%s" % (meta.get("exit_code"), out)
+                except Exception:
+                    pass
+            text = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+            step = self.tool_index.get(p.get("call_id"))
+            m = re.search(r"Process exited with code (\d+)", text[:300])
+            is_err = bool(m and m.group(1) != "0") or text.startswith("[exit code")
+            if step is None:
+                step = self.add_step(ts, "tool", id=p.get("call_id"), name="?", input={}, result=trim(text), isError=is_err, resultTs=ts)
+            else:
+                step["result"] = trim(text)
+                step["isError"] = is_err
+                step["resultTs"] = ts
+            if ts and self.cur is not None:
+                self.cur["endTs"] = ts
+        elif pt == "web_search_call":
+            a = p.get("action") or {}
+            t = self.ensure_turn(ts)
+            self.add_step(ts, "tool", id=p.get("id"), name="web_search", input={"query": a.get("query") or a.get("queries") or a.get("type")},
+                          result=p.get("status") or "", isError=False, resultTs=ts)
+            t["toolCount"] += 1
+
+    def feed_event(self, p, ts):
+        pt = p.get("type")
+        if pt == "task_complete":
+            if self.cur is not None and p.get("duration_ms"):
+                self.cur["durationMs"] = p["duration_ms"]
+        elif pt == "turn_aborted":
+            if self.cur is not None:
+                self.cur["interrupted"] = True
+            self.add_step(ts, "interrupt", text="turn aborted: %s" % (p.get("reason") or ""))
+        elif pt == "item_completed":
+            item = p.get("item") or {}
+            if item.get("type") == "Plan" and item.get("text"):
+                t = self.ensure_turn(ts)
+                self.add_step(ts, "text", text=item["text"], name="plan")
+                t["responses"].append({"ts": ts, "text": item["text"]})
+        elif pt == "error":
+            msg = p.get("message") or json.dumps(p, ensure_ascii=False)
+            self.add_step(ts, "system", name="error", text=trim(msg, 4000))
+        # user_message / agent_message / agent_reasoning は response_item と重複するため使わない
+
+    def load_subagents(self):
+        return
+
+    def run(self):
+        sess = SessionParser.run(self)
+        if not sess.get("title"):
+            for t in self.turns:
+                if t["kind"] == "typed" and t["prompt"]:
+                    first = t["prompt"].strip().split("\n")[0]
+                    sess["title"] = first[:60]
+                    break
+        return sess
+
+
+def is_codex_file(path):
+    return os.path.basename(path).startswith("rollout-")
+
+
 def light_steps(steps, role, content, ts):
     """サブエージェント用の軽量ステップ列を追加する。"""
     if content is None:
@@ -687,7 +922,7 @@ def load_session(path, use_cache=True):
                 return json.load(f)
         except Exception:
             pass
-    sess = SessionParser(path).run()
+    sess = (CodexSessionParser(path) if is_codex_file(path) else SessionParser(path)).run()
     if use_cache:
         try:
             os.makedirs(CACHE_DIR, exist_ok=True)
@@ -769,9 +1004,16 @@ def norm_root(p):
     return os.path.abspath(os.path.expanduser(p))
 
 
+def default_roots():
+    roots = [DEFAULT_DIR]
+    if os.path.isdir(CODEX_DIR):
+        roots.append(CODEX_DIR)
+    return roots
+
+
 def resolve_roots(dirs, use_saved=True):
     """CLI 指定（無ければ既定）に、UI から追加して保存済みの場所を足す。"""
-    roots = [norm_root(d) for d in (dirs or [DEFAULT_DIR])]
+    roots = [norm_root(d) for d in (dirs or default_roots())]
     if use_saved:
         roots += [norm_root(r) for r in load_saved_roots()]
     out = []
@@ -816,6 +1058,58 @@ def resolve_members(groups, pid):
     return list(g["members"]) if g else [pid]
 
 
+def is_codex_root(root):
+    r = root.rstrip("/")
+    if r.endswith("/.codex/sessions"):
+        return True
+    if glob.glob(os.path.join(root, "rollout-*.jsonl")):
+        return True
+    return bool(glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")))
+
+
+_codex_cwd_cache = {}
+
+
+def codex_session_cwd(path):
+    key = (path, os.path.getmtime(path), os.path.getsize(path))
+    if key in _codex_cwd_cache:
+        return _codex_cwd_cache[key]
+    cwd = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 30:
+                    break
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                p = o.get("payload") if isinstance(o.get("payload"), dict) else {}
+                if o.get("type") in ("session_meta", "turn_context") and p.get("cwd"):
+                    cwd = p["cwd"]
+                    break
+    except Exception:
+        pass
+    _codex_cwd_cache[key] = cwd
+    return cwd
+
+
+def codex_index(root):
+    """Codex のロールアウトを作業ディレクトリ（Claude Code と同じフォルダ名規則）ごとにまとめる。"""
+    out = {}
+    files = glob.glob(os.path.join(root, "**", "rollout-*.jsonl"), recursive=True)
+    for f in files:
+        if os.path.getsize(f) <= 0:
+            continue
+        cwd = codex_session_cwd(f)
+        if not cwd:
+            continue
+        pid = sanitize_path(cwd)
+        e = out.setdefault(pid, {"cwd": cwd, "files": []})
+        e["files"].append(f)
+    return out
+
+
 def _jsonl_files(pd):
     return [f for f in sorted(glob.glob(os.path.join(pd, "*.jsonl"))) if os.path.getsize(f) > 0]
 
@@ -825,10 +1119,14 @@ def project_files(roots, pid, groups=None):
     best = {}
     for member in resolve_members(groups, pid):
         for root in roots:
-            pd = os.path.join(root, member)
-            if not os.path.isdir(pd):
-                continue
-            for f in _jsonl_files(pd):
+            if is_codex_root(root):
+                files = (codex_index(root).get(member) or {}).get("files") or []
+            else:
+                pd = os.path.join(root, member)
+                if not os.path.isdir(pd):
+                    continue
+                files = _jsonl_files(pd)
+            for f in files:
                 b = os.path.basename(f)
                 if b not in best or os.path.getsize(f) > os.path.getsize(best[b]):
                     best[b] = f
@@ -859,6 +1157,16 @@ def list_projects(roots, groups=None):
     for root in roots:
         if not os.path.isdir(root):
             continue
+        if is_codex_root(root):
+            for d, ci in codex_index(root).items():
+                e = by_id.setdefault(d, {"id": d, "files": {}, "roots": [], "cwd": None, "agents": set()})
+                e["roots"].append(root)
+                e["agents"].add("codex")
+                for f in ci["files"]:
+                    e["files"][os.path.basename(f)] = f
+                if not e["cwd"]:
+                    e["cwd"] = ci["cwd"]
+            continue
         for d in sorted(os.listdir(root)):
             pd = os.path.join(root, d)
             if not os.path.isdir(pd):
@@ -866,8 +1174,9 @@ def list_projects(roots, groups=None):
             files = _jsonl_files(pd)
             if not files:
                 continue
-            e = by_id.setdefault(d, {"id": d, "files": {}, "roots": [], "cwd": None})
+            e = by_id.setdefault(d, {"id": d, "files": {}, "roots": [], "cwd": None, "agents": set()})
             e["roots"].append(root)
+            e["agents"].add("claude")
             for f in files:
                 b = os.path.basename(f)
                 if b not in e["files"] or os.path.getsize(f) > os.path.getsize(e["files"][b]):
@@ -884,6 +1193,7 @@ def list_projects(roots, groups=None):
             "path": cwd,
             "name": project_name(d, cwd),
             "roots": e["roots"],
+            "agents": sorted(e["agents"]),
             "sessionCount": len(files),
             "bytes": sum(os.path.getsize(f) for f in files),
             "lastModified": datetime.fromtimestamp(max(mtimes), tz=timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -912,6 +1222,7 @@ def list_projects(roots, groups=None):
             "members": [{"id": m["id"], "path": m["path"], "name": m["name"], "sessionCount": m["sessionCount"]} for m in members],
             "missingMembers": [x for x in g["members"] if x not in [m["id"] for m in members]],
             "roots": sorted({r for m in members for r in m["roots"]}),
+            "agents": sorted({a for m in members for a in m.get("agents", [])}),
             "sessionCount": len(files),
             "bytes": sum(os.path.getsize(f) for f in files),
             "lastModified": max(m["lastModified"] for m in members),
@@ -957,8 +1268,11 @@ def load_project(roots, pid, use_cache=True, progress=None, groups=None):
         turns.extend(s["turns"])
         meta = {k: v for k, v in s.items() if k not in ("turns", "sidechains")}
         meta["sidechains"] = s.get("sidechains") or {}
-        meta["root"] = os.path.dirname(os.path.dirname(f))
-        meta["projectDir"] = os.path.basename(os.path.dirname(f))
+        meta["root"] = next((r for r in roots if f.startswith(r.rstrip("/") + os.sep)), os.path.dirname(os.path.dirname(f)))
+        if is_codex_file(f):
+            meta["projectDir"] = sanitize_path(s["cwd"]) if s.get("cwd") else os.path.basename(os.path.dirname(f))
+        else:
+            meta["projectDir"] = os.path.basename(os.path.dirname(f))
         sessions.append(meta)
     turns.sort(key=lambda t: (t["ts"] or "", t["id"]))
     sessions.sort(key=lambda s: s["firstTs"] or "")
@@ -975,6 +1289,7 @@ def load_project(roots, pid, use_cache=True, progress=None, groups=None):
             members.append({"id": m, "path": mp, "name": project_name(m, mp), "sessionCount": len(ss)})
     return {
         "id": pid,
+        "agents": sorted({s.get("agent", "claude") for s in sessions}),
         "path": " + ".join(m["path"] for m in members if m["sessionCount"]) if group else cwd,
         "name": group["name"] if group else project_name(pid, cwd),
         "group": bool(group),
@@ -996,7 +1311,7 @@ def turn_light(t):
 
 def project_light(p):
     return {
-        "id": p["id"], "path": p["path"], "name": p["name"], "roots": p.get("roots", []), "group": p.get("group", False), "members": p.get("members", []), "generatedAt": p.get("generatedAt"),
+        "id": p["id"], "path": p["path"], "name": p["name"], "roots": p.get("roots", []), "agents": p.get("agents", []), "group": p.get("group", False), "members": p.get("members", []), "generatedAt": p.get("generatedAt"),
         "sessions": [{k: v for k, v in s.items() if k != "sidechains"} for s in p["sessions"]],
         "turns": [turn_light(t) for t in p["turns"]],
         "light": True,
@@ -1065,6 +1380,9 @@ def fmt_local(ts):
     return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
 
+AGENT_NAME = {"claude": "Claude Code", "codex": "Codex"}
+
+
 def turn_label(t):
     if t.get("prompt"):
         return t["prompt"]
@@ -1077,19 +1395,19 @@ def project_csv(project, mode="prompts"):
     KIND_LABEL = _("kinds")
     stitle = {s["id"]: (s.get("title") or s["id"][:8]) for s in project["sessions"]}
     if mode == "prompts":
-        w.writerow(_("csv_prompts"))
+        w.writerow(_("csv_prompts") + [_("csv_agent")])
         for t in project["turns"]:
             if t["kind"] not in ("typed", "queued", "command", "shell"):
                 continue
-            w.writerow([fmt_local(t["ts"]), stitle.get(t["sid"], t["sid"]), KIND_LABEL.get(t["kind"], t["kind"]), t["prompt"]])
+            w.writerow([fmt_local(t["ts"]), stitle.get(t["sid"], t["sid"]), KIND_LABEL.get(t["kind"], t["kind"]), t["prompt"], AGENT_NAME.get(t.get("agent"), "")])
     elif mode == "pairs":
-        w.writerow(_("csv_pairs"))
+        w.writerow(_("csv_pairs") + [_("csv_agent")])
         for t in project["turns"]:
             resp = "\n\n".join(r["text"] for r in t["responses"])
             rts = t["responses"][-1]["ts"] if t["responses"] else ""
             w.writerow([fmt_local(t["ts"]), stitle.get(t["sid"], t["sid"]), KIND_LABEL.get(t["kind"], t["kind"]),
                         turn_label(t), fmt_local(rts), resp, t.get("recap") or "",
-                        round((t.get("durationMs") or 0) / 1000), t["toolCount"]])
+                        round((t.get("durationMs") or 0) / 1000), t["toolCount"], AGENT_NAME.get(t.get("agent"), "")])
     else:
         w.writerow(_("csv_full"))
         for i, t in enumerate(project["turns"], 1):
@@ -1130,14 +1448,15 @@ class Store:
         return out
 
     def roots_info(self):
-        return [{"path": r, "ok": os.path.isdir(r), "saved": r in self.saved_roots and r not in self.cli_roots}
+        return [{"path": r, "ok": os.path.isdir(r), "saved": r in self.saved_roots and r not in self.cli_roots,
+                 "kind": "codex" if os.path.isdir(r) and is_codex_root(r) else "claude"}
                 for r in self.roots]
 
     def add_root(self, path):
         r = norm_root(path)
         if not os.path.isdir(r):
             raise FileNotFoundError(_("dir_missing") % r)
-        if not any(os.path.isdir(os.path.join(r, d)) for d in os.listdir(r)):
+        if not is_codex_root(r) and not any(os.path.isdir(os.path.join(r, d)) for d in os.listdir(r)):
             raise ValueError(_("no_project_dirs") % r)
         if r not in self.saved_roots and r not in self.cli_roots:
             self.saved_roots.append(r)
@@ -1342,7 +1661,7 @@ def cmd_serve(args):
         sys.stderr.write(_("no_dir") % r + "\n")
     if len(missing) == len(roots):
         sys.exit(_("no_dirs"))
-    store = Store([norm_root(d) for d in (args.dir or [DEFAULT_DIR])], use_cache=not args.no_cache)
+    store = Store([norm_root(d) for d in (args.dir or default_roots())], use_cache=not args.no_cache)
     if args.no_config:
         store.saved_roots = []
     port = args.port
@@ -1579,6 +1898,9 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
 #projList li .body{min-width:0;flex:1}
 #projList .pmember{font-size:11px;color:var(--muted);padding-left:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .badge.group{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.badge.agent-codex{background:#111;color:#fff;border-color:#111}
+.badge.agent-claude{background:#d97757;color:#fff;border-color:#d97757}
+.turn.agent-codex{border-left-style:double}
 #groupInfo{margin-top:6px;font-size:12px}
 #groupInfo .gm{color:var(--ink2);padding-left:6px}
 .rootrow{display:flex;gap:4px;align-items:flex-start;padding:2px 0}
@@ -1742,6 +2064,11 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
             <option value="response" data-i18n="scopeResponse"></option>
             <option value="all" data-i18n="scopeAll"></option>
           </select>
+          <select id="agentFilter" class="hidden" data-i18n-title="agentTitle">
+            <option value="" data-i18n="agentAll"></option>
+            <option value="claude">Claude Code</option>
+            <option value="codex">Codex</option>
+          </select>
           <select id="order" data-i18n-title="orderTitle">
             <option value="asc" data-i18n="orderAsc"></option>
             <option value="desc" data-i18n="orderDesc"></option>
@@ -1795,7 +2122,7 @@ ja: {
   rootsTitle:'ログの場所', rootInput:'追加するディレクトリのパス', btnRootAdd:'追加', btnHelp:'キー操作', btnSide:'サイドバー切替',
   btnRefresh:'ログを更新', btnRefreshTitle:'このプロジェクトのログを再読み込み', empty:'左のリストからプロジェクトを選んでください',
   q:'キーワード検索（スペース区切りで AND）  [/]', scopePrompt:'範囲: 依頼', scopeResponse:'範囲: 応答', scopeAll:'範囲: 全体（推論・ツールログ含む）',
-  orderTitle:'並び順', orderAsc:'古い順', orderDesc:'新しい順',
+  orderTitle:'並び順', orderAsc:'古い順', orderDesc:'新しい順', agentTitle:'エージェント', agentAll:'すべてのエージェント', csvAgent:'エージェント',
   showImg:'画像を表示', openImage:'新しいタブで開く', imageN:'画像 {n}', noImageData:'画像は書き出し版に含まれていません（export --images で埋め込み可）',
   dateFrom:'開始日', dateTo:'終了日', pinOnly:'ピン留めのみ', humanOnly:'依頼のあるターンのみ', showPeer:'他エージェントからのメッセージ（畳んで表示）', showSys:'通知・システム行を表示',
   expandResp:'応答を全展開', expandDetail:'詳細を全展開', collapseAll:'全て閉じる', exportBtn:'書き出し / コピー ▾', exportNote:'※ 現在の絞り込み結果が対象',
@@ -1834,7 +2161,7 @@ en: {
   rootsTitle:'Log locations', rootInput:'Directory path to add', btnRootAdd:'Add', btnHelp:'Keys', btnSide:'Toggle sidebar',
   btnRefresh:'Reload logs', btnRefreshTitle:'Re-read the logs of this project', empty:'Select a project from the list on the left',
   q:'Search keywords (space = AND)  [/]', scopePrompt:'Scope: prompts', scopeResponse:'Scope: responses', scopeAll:'Scope: everything (incl. reasoning & tool logs)',
-  orderTitle:'Sort order', orderAsc:'Oldest first', orderDesc:'Newest first',
+  orderTitle:'Sort order', orderAsc:'Oldest first', orderDesc:'Newest first', agentTitle:'Agent', agentAll:'All agents', csvAgent:'Agent',
   showImg:'Show images', openImage:'Open in new tab', imageN:'Image {n}', noImageData:'Images are not included in this export (use export --images)',
   dateFrom:'From', dateTo:'To', pinOnly:'Pinned only', humanOnly:'Turns with a prompt only', showPeer:'Messages from other agents (folded)', showSys:'Show notification / system rows',
   expandResp:'Expand all responses', expandDetail:'Expand all details', collapseAll:'Collapse all', exportBtn:'Export / Copy ▾', exportNote:'Applies to the current filtered result',
@@ -1870,6 +2197,7 @@ en: {
 let LANG = (() => { try{ const v = localStorage.getItem('cldviewer.lang'); if(v && I18N[v]) return v; }catch(e){} return I18N[DEFAULT_LANG] ? DEFAULT_LANG : 'ja'; })();
 function tr(key, vars){ let s = I18N[LANG][key]; if(s == null) s = I18N.ja[key]; if(s == null) return key; if(typeof s !== 'string') return s; if(vars) for(const k in vars) s = s.split('{' + k + '}').join(vars[k]); return s; }
 function kindLabel(k){ return I18N[LANG].kinds[k] || k; }
+function agentName(t){ return t.agent === 'codex' ? 'Codex' : 'Claude Code'; }
 function turnLabel(t){ return t.labelKey ? (I18N[LANG].labels[t.labelKey] || t.labelKey) : (t.label || ''); }
 function stepLabel(k){ return I18N[LANG].steps[k] || k; }
 function applyI18n(){
@@ -2063,7 +2391,7 @@ async function loadProjects(){
 function renderRoots(){
   const box = $('#roots'); box.innerHTML = '';
   for(const r of state.roots){
-    const row = el('div', {class:'rootrow' + (r.ok ? '' : ' ng'), title: r.ok ? r.path : r.path + tr('rootMissing')}, el('span', {class:'rp'}, r.path));
+    const row = el('div', {class:'rootrow' + (r.ok ? '' : ' ng'), title: r.ok ? r.path : r.path + tr('rootMissing')}, el('span', {class:'rp'}, r.path), r.kind === 'codex' ? el('span', {class:'badge agent-codex'}, 'Codex') : null);
     if(r.saved && !EMBEDDED) row.append(el('button', {class:'icon', title: tr('rootRemove'), onclick: () => changeRoot('remove', r.path)}, '×'));
     box.append(row);
   }
@@ -2124,7 +2452,8 @@ function renderProjectList(){
     const hay = (p.name + ' ' + p.path + ' ' + (p.members || []).map(m => m.path).join(' ')).toLowerCase();
     if(f && !hay.includes(f)) continue;
     const body = el('div', {class:'body'},
-      el('div', {class:'pname'}, p.name, p.group ? el('span', {class:'badge group', style:'margin-left:6px'}, tr('groupBadge', {n: p.members.length})) : null),
+      el('div', {class:'pname'}, p.name, p.group ? el('span', {class:'badge group', style:'margin-left:6px'}, tr('groupBadge', {n: p.members.length})) : null,
+        (p.agents || []).includes('codex') ? el('span', {class:'badge agent-codex', style:'margin-left:6px'}, (p.agents.length > 1 ? 'Claude + ' : '') + 'Codex') : null),
       p.group ? null : el('div', {class:'ppath'}, p.path),
       el('div', {class:'pmeta'}, tr('pmeta', {n: p.sessionCount, size: fmtBytes(p.bytes), date: fmtDT(p.lastModified).slice(0,16)}) + ((p.roots || []).length > 1 ? tr('places', {n: p.roots.length}) : '')));
     if(p.group) for(const m of p.members) body.append(el('div', {class:'pmember', title: m.path}, '└ ' + m.path));
@@ -2168,6 +2497,7 @@ function renderProject(){
       el('button', {class:'small', onclick: () => { if(confirm(tr('unmergeConfirm'))) changeGroup({action:'delete', id: p.id}); }}, tr('unmerge'))));
   }
   const chips = $('#sessionChips'); chips.innerHTML = '';
+  $('#agentFilter').classList.toggle('hidden', (p.agents || []).length < 2);
   const all = el('button', {class:'chip' + (state.sessionFilter ? '' : ' on'), onclick: () => { state.sessionFilter = null; renderProject(); }}, tr('allSessions'));
   chips.append(all);
   p.sessions.forEach((s, i) => {
@@ -2176,8 +2506,10 @@ function renderProject(){
     const title = tr('chipTitle', {id: s.id, from: fmtDT(s.firstTs), to: fmtDT(s.lastTs), n: turns, cost, compact: s.compactions ? tr('compactions', {n: s.compactions}) : '', cont: s.continuedIn ? tr('continuedIn') + s.continuedIn : '', file: s.file});
     const multi = (p.roots || []).length > 1;
     const mi = p.group ? p.members.findIndex(m => m.id === s.projectDir) : -1;
+    const mixed = (p.agents || []).length > 1;
     const c = el('button', {class:'chip' + (state.sessionFilter === s.id ? ' on' : ''), title, onclick: () => { state.sessionFilter = state.sessionFilter === s.id ? null : s.id; renderProject(); }},
       el('span', {class:'dot', style:'background:' + sessionColor(s.id)}), `S${i+1} `, el('span', {class:'muted'}, (s.title || s.id.slice(0,8)).slice(0, 28)), el('span', {class:'muted'}, ` ${fmtDT(s.firstTs).slice(0,10)} · ${turns}`),
+      (s.agent === 'codex' || mixed) ? el('span', {class:'badge agent-' + (s.agent || 'claude')}, s.agent === 'codex' ? 'Codex' : 'Claude') : null,
       mi >= 0 ? el('span', {class:'badge', title: p.members[mi].path}, '📂' + (mi + 1)) : null,
       multi ? el('span', {class:'badge', title: s.root}, '📁' + (p.roots.indexOf(s.root) + 1)) : null);
     chips.append(c);
@@ -2215,9 +2547,10 @@ function matches(t){
 function visibleTurnsAsc(){
   const p = state.project; if(!p) return [];
   const from = $('#dateFrom').value, to = $('#dateTo').value;
-  const pinOnly = $('#pinOnly').checked, humanOnly = $('#humanOnly').checked, showPeer = $('#showPeer').checked;
+  const pinOnly = $('#pinOnly').checked, humanOnly = $('#humanOnly').checked, showPeer = $('#showPeer').checked, agent = $('#agentFilter').value;
   return p.turns.filter(t => {
     if(state.sessionFilter && t.sid !== state.sessionFilter) return false;
+    if(agent && (t.agent || 'claude') !== agent) return false;
     if(t.kind === 'peer'){ if(!showPeer) return false; }
     else if(humanOnly && !HUMAN_KINDS.has(t.kind)) return false;
     if(pinOnly && !state.pins.has(t.id)) return false;
@@ -2258,7 +2591,8 @@ function renderTimeline(){
 function renderTurn(t){
   const o = state.open[t.id] || {};
   const folded = t.kind === 'peer' && !o.unfold && !state.terms.length;
-  const card = el('article', {class:'turn kind-' + t.kind + (state.pins.has(t.id) ? ' pinned' : '') + (state.terms.length ? ' match' : '') + (folded ? ' folded' : ''), id:'t-' + t.id, tabindex:0, 'data-id': t.id});
+  const card = el('article', {class:'turn kind-' + t.kind + ' agent-' + (t.agent || 'claude') + (state.pins.has(t.id) ? ' pinned' : '') + (state.terms.length ? ' match' : '') + (folded ? ' folded' : ''), id:'t-' + t.id, tabindex:0, 'data-id': t.id});
+  const mixedAgents = (state.project.agents || []).length > 1;
   const head = el('div', {class:'thead'},
     el('span', {class:'time', title: t.ts}, fmtT(t.ts)),
     el('span', {class:'badge kind-' + t.kind}, kindLabel(t.kind) + (t.sender ? ': ' + t.sender : '')),
@@ -2269,6 +2603,7 @@ function renderTurn(t){
     head.prepend(tog);
     if(folded){ head.append(el('span', {class:'preview muted'}, (t.prompt || '').split('\n').find(l => l.trim()) || '')); head.addEventListener('click', ev => { if(ev.target.closest('button')) return; tog.click(); }); }
   }
+  if(t.agent === 'codex' || mixedAgents) head.append(el('span', {class:'badge agent-' + (t.agent || 'claude')}, t.agent === 'codex' ? 'Codex' : 'Claude'));
   if(t.images) head.append(el('span', {class:'badge'}, tr('images', {n: t.images})));
   if(t.interrupted) head.append(el('span', {class:'badge err'}, tr('interrupted')));
   const meta = el('span', {class:'meta'});
@@ -2332,7 +2667,8 @@ function fillResponses(t, panel){
 function toolSummary(s){
   const inp = s.input || {};
   if(typeof inp === 'string') return inp.split('\n')[0];
-  const pick = inp.command || inp.file_path || inp.path || inp.pattern || inp.description || inp.prompt || inp.query || inp.url || inp.title || inp.skill;
+  if(Array.isArray(inp.files) && inp.files.length) return inp.files.join(', ');
+  const pick = inp.command || inp.cmd || inp.file_path || inp.path || inp.pattern || inp.description || inp.prompt || inp.query || inp.url || inp.title || inp.skill || inp.chars;
   if(pick) return String(pick).split('\n')[0];
   const k = Object.keys(inp); if(!k.length) return '';
   const v = inp[k[0]]; return k[0] + ': ' + (typeof v === 'string' ? v.split('\n')[0] : JSON.stringify(v));
@@ -2401,11 +2737,11 @@ async function exportCSV(mode){
   const turns = visibleTurns(); const rows = [];
   if(mode === 'full'){ try{ await ensureDetails(turns); }catch(e){ alert(tr('fetchFailed') + e.message); return; } }
   if(mode === 'prompts'){
-    rows.push(tr('csvHeadPrompts'));
-    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), kindLabel(t.kind), t.prompt || turnLabel(t)]);
+    rows.push(tr('csvHeadPrompts').concat([tr('csvAgent')]));
+    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), kindLabel(t.kind), t.prompt || turnLabel(t), agentName(t)]);
   } else if(mode === 'pairs'){
-    rows.push(tr('csvHeadPairs'));
-    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), kindLabel(t.kind), t.prompt || turnLabel(t), t.responses.length ? fmtDT(t.responses[t.responses.length-1].ts) : '', t.responses.map(r => r.text).join('\n\n'), t.recap || '', t.durationMs != null ? Math.round(t.durationMs/1000) : '', t.toolCount]);
+    rows.push(tr('csvHeadPairs').concat([tr('csvAgent')]));
+    for(const t of turns) rows.push([fmtDT(t.ts), stitle(t.sid), kindLabel(t.kind), t.prompt || turnLabel(t), t.responses.length ? fmtDT(t.responses[t.responses.length-1].ts) : '', t.responses.map(r => r.text).join('\n\n'), t.recap || '', t.durationMs != null ? Math.round(t.durationMs/1000) : '', t.toolCount, agentName(t)]);
   } else {
     rows.push(tr('csvHeadFull'));
     turns.forEach((t, i) => {
@@ -2424,7 +2760,7 @@ async function exportCSV(mode){
 function exportMD(mode){
   const turns = visibleTurns(); const out = [`# ${state.project.name} — ${mode === 'prompts' ? tr('mdPromptsTitle') : tr('mdPairsTitle')}`, ''];
   for(const t of turns){
-    out.push(`## ${fmtDT(t.ts)} [${kindLabel(t.kind)}] (${sessionLabel(t.sid)})`, '', t.prompt || turnLabel(t), '');
+    out.push(`## ${fmtDT(t.ts)} [${kindLabel(t.kind)}] (${sessionLabel(t.sid)}${t.agent === 'codex' ? ', Codex' : ''})`, '', t.prompt || turnLabel(t), '');
     if(mode === 'pairs'){ if(t.recap) out.push(tr('mdRecap') + t.recap, ''); for(const r of t.responses) out.push(tr('mdResponse') + fmtDT(r.ts), '', r.text, ''); }
   }
   copyText(out.join('\n'));
@@ -2452,7 +2788,7 @@ async function applySearch(){
 let searchTimer;
 $('#q').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(applySearch, 250); });
 $('#scope').addEventListener('change', applySearch);
-for(const id of ['dateFrom','dateTo','pinOnly','humanOnly','showPeer','showSys']) $('#' + id).addEventListener('change', () => { if(state.project) renderTimeline(); });
+for(const id of ['dateFrom','dateTo','pinOnly','humanOnly','showPeer','showSys','agentFilter']) $('#' + id).addEventListener('change', () => { if(state.project) renderTimeline(); });
 try{ const v = localStorage.getItem('cldviewer.showImg'); if(v === '0') $('#showImg').checked = false; }catch(e){}
 $('#showImg').addEventListener('change', () => { try{ localStorage.setItem('cldviewer.showImg', $('#showImg').checked ? '1' : '0'); }catch(e){} if(state.project) renderTimeline(); });
 $('#lightbox').addEventListener('click', ev => { if(!ev.target.closest('a')) closeLightbox(); });

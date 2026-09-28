@@ -5,7 +5,8 @@
 > It groups logs by project, shows your prompts as a timeline first, and lets you expand
 > Claude's responses and the detailed reasoning / tool-call logs on demand. Includes scoped
 > keyword search, CSV / Markdown export, copy buttons, pinning, merging logs from several
-> locations, and merging projects whose working path has changed. Run `python3 cldviewer.py`
+> locations, and merging projects whose working path has changed. OpenAI Codex session logs
+> (`~/.codex/sessions/`) are converted to the same structure and shown on the same timeline. Run `python3 cldviewer.py`
 > and a browser opens. `python3 cldviewer.py export -o cld.html` produces a standalone HTML
 > that needs no Python. The UI is bilingual: click the **EN / 日本語** button in the sidebar to
 > switch, or start with `python3 cldviewer.py --lang en` (also `CLDVIEWER_LANG=en`) to make
@@ -13,6 +14,7 @@
 
 `~/.claude/projects/` に蓄積される Claude Code のセッションログ（JSONL）を、
 プロジェクト（作業フォルダ）単位で時系列に振り返るためのビューアです。
+OpenAI Codex（`~/.codex/sessions/`）のログも同じ形式に変換して、同じタイムライン上で扱えます。
 
 - **Python 3 の標準ライブラリだけで動く単一ファイル**（`cldviewer.py`）。コピーするだけでどの端末でも動く
 - 最初は「自分が出した依頼」だけが時系列に並び、必要に応じて「応答」「推論・実行ログ」を段階的に展開
@@ -58,6 +60,20 @@ python3 cldviewer.py --dir ~/.claude/projects --dir /Volumes/HDD/claude-projects
   同じセッション ID のファイルが両方にあるときは大きい方を採用します。
 - 外れているドライブは赤い取り消し線で表示され、読み込みはスキップされます。
 - `--no-config` を付けると、保存済みの設定（ログの場所・プロジェクト統合）を読み込みません。
+
+### Codex のログ
+
+- `~/.codex/sessions/` があれば既定で読み込みます（`--dir` で別の場所を指定することもできます。
+  `rollout-*.jsonl` を含むディレクトリは Codex のログとして扱われます）。
+- Codex のセッションは作業ディレクトリ（cwd）を Claude Code と同じ規則でフォルダ名に変換して
+  プロジェクトを同定するので、同じディレクトリで作業した Claude Code のログと自動的に同じプロジェクトになります。
+  パスが違う場合は「統合」機能でまとめられます（Claude Code と Codex の混在も可）。
+- 変換の対応: 依頼 = ユーザーメッセージ（Codex が自動注入する環境情報・添付ファイル一覧などは除外し、
+  `## My request:` 以降を依頼として抽出）、応答 = アシスタントのメッセージ、推論 = reasoning の要約、
+  ツール = `exec_command` / `apply_patch` などの呼び出しと出力、所要時間 = `task_complete`、中断 = `turn_aborted`、
+  圧縮 = `compacted`。
+- Codex のターンとセッションには黒い **Codex** バッジが付き、両方が混在するプロジェクトでは
+  ツールバーにエージェントの絞り込みが現れます。CSV にもエージェント列が加わります。
 
 ### パスが変わって分かれたプロジェクトを統合する
 
